@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Athanor-Wails",
+  "outputfilename": "Athanor-Wails",
+  "frontend:install": "pnpm install",
+  "frontend:build": "pnpm run build",
+  "frontend:dev:watcher": "pnpm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "pengboyu-dev",
+    "email": "penboy.seven@gmail.com"
+  }
+}

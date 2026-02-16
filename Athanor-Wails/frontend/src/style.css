@@ -1,0 +1,83 @@
+/* ═══════════════════════════════════════════════════════════════════════ */
+/* ATHANOR EPUB CONVERTER — GLOBAL STYLES                                 */
+/* Tailwind CSS v4: single @import replaces the v3 @tailwind directives   */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+@import "tailwindcss";
+
+/* ── Custom theme tokens ─────────────────────────────────────────────── */
+
+@theme {
+  --color-terminal-bg: oklch(0.13 0.005 285);
+  --color-panic-glow: oklch(0.55 0.25 27);
+}
+
+/* ── Root element resets ─────────────────────────────────────────────── */
+
+html {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: #09090b;
+}
+
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: #09090b;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* ── Scrollbar (Webkit / Wails webview) ──────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: #3f3f46;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: #52525b;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ── Disable selection highlight on interactive elements ─────────────── */
+
+[role="button"] {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* ── Panic-mode pulsing glow keyframes ───────────────────────────────── */
+
+@keyframes panic-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 15px 0 rgba(239, 68, 68, 0.25);
+  }
+  50% {
+    box-shadow: 0 0 35px 5px rgba(239, 68, 68, 0.45);
+  }
+}
