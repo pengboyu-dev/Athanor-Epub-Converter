@@ -40,7 +40,7 @@ const (
 	MaxPixelCount       = 500_000_000       // 500 megapixels
 	MaxDecompressedSize = 500 * 1024 * 1024 // 500MB per image decode
 	MaxLogLines         = 10000
-	PandocTimeout       = 20 * time.Minute
+	PandocTimeout       = 120 * time.Minute
 	StreamBufferSize    = 64 * 1024 // 64KB IO buffer
 	TargetDPI           = 96
 	JPEGQuality         = 95
@@ -99,7 +99,7 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	a.log("🔥 ATHANOR V4.0 FINAL — Dual Output Edition")
+	a.log("🔥 ATHANOR V4.2 — LuaLaTeX Unlimited Edition")
 	a.log(fmt.Sprintf("⚙️  Platform: %s/%s | CPUs: %d", runtime.GOOS, runtime.GOARCH, runtime.NumCPU()))
 	a.log("🛡️  Protocols: MonsterKiller | DPI-Injector | ①②③-Fix | AI-Markdown")
 	a.log("════════════════════════════════════════════════════════════════")
@@ -255,7 +255,7 @@ func (a *App) ConvertBook(inputPath string, outputFormat string) ConversionProgr
 	if wantPDF {
 		a.progress(jobID, "pdf", 70, "📄 PDF 渲染 (XeLaTeX + ①②③ 修复)...")
 		pdfPath := outputPath(inputPath, "pdf")
-		if err := a.toPDF(cleanEpub, pdfPath, workDir); err != nil {
+		if err := a.toPDF(cleanEpub, pdfPath, workDir, jobID); err != nil {
 			return a.fail(jobID, fmt.Sprintf("PDF 失败: %v\n💡 确保已安装 Pandoc + XeLaTeX", err))
 		}
 
@@ -560,7 +560,6 @@ func flattenAlpha(img image.Image) (image.Image, string) {
 	bounds := img.Bounds()
 	transparent := false
 
-	// 采样检测（大图加速）
 	step := 1
 	if bounds.Dx()*bounds.Dy() > 1_000_000 {
 		step = 10
@@ -585,7 +584,7 @@ func flattenAlpha(img image.Image) (image.Image, string) {
 }
 
 // ============================================================================
-// 8. DPI-AWARE RE-ENCODING (The 1-DPI Killer)
+// 8. DPI-AWARE RE-ENCODING
 // ============================================================================
 
 func (a *App) reencode(path string, img image.Image, ext string) error {
@@ -597,7 +596,6 @@ func (a *App) reencode(path string, img image.Image, ext string) error {
 			return err
 		}
 	default:
-		// JPEG for everything else (strips metadata, forces baseline)
 		if err := saveJPEGWithDPI(tmpPath, img); err != nil {
 			return err
 		}
@@ -613,56 +611,47 @@ func saveJPEGWithDPI(path string, img image.Image) error {
 	}
 	defer f.Close()
 
-	// 编码到缓冲区
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: JPEGQuality}); err != nil {
 		return err
 	}
 
-	// 注入 96 DPI 到 JFIF 头
 	data := injectJFIFDPI(buf.Bytes(), TargetDPI)
-
 	_, err = f.Write(data)
 	return err
 }
 
-// injectJFIFDPI 在 JPEG 字节流中强制设置 DPI
-// 如果已有 JFIF APP0 段则修改，否则插入新段
 func injectJFIFDPI(data []byte, dpi int) []byte {
 	if len(data) < 20 {
 		return data
 	}
 
-	// 搜索已有的 JFIF APP0 (FF E0)
 	for i := 2; i < len(data)-16; i++ {
 		if data[i] == 0xFF && data[i+1] == 0xE0 {
-			// 验证 JFIF 标识
 			if i+9 <= len(data) && string(data[i+4:i+9]) == "JFIF\x00" {
-				// 修改已有 JFIF 段的 DPI
-				data[i+11] = 0x01                                        // units = DPI
-				binary.BigEndian.PutUint16(data[i+12:i+14], uint16(dpi)) // X density
-				binary.BigEndian.PutUint16(data[i+14:i+16], uint16(dpi)) // Y density
+				data[i+11] = 0x01
+				binary.BigEndian.PutUint16(data[i+12:i+14], uint16(dpi))
+				binary.BigEndian.PutUint16(data[i+14:i+16], uint16(dpi))
 				return data
 			}
 		}
 	}
 
-	// 没找到 JFIF，在 SOI (FF D8) 后插入新的 APP0 段
 	jfif := []byte{
-		0xFF, 0xE0, // APP0 marker
-		0x00, 0x10, // length = 16
-		'J', 'F', 'I', 'F', 0x00, // identifier
-		0x01, 0x01, // version 1.1
-		0x01,                      // units = DPI
-		byte(dpi >> 8), byte(dpi), // X density
-		byte(dpi >> 8), byte(dpi), // Y density
-		0x00, 0x00, // thumbnail size
+		0xFF, 0xE0,
+		0x00, 0x10,
+		'J', 'F', 'I', 'F', 0x00,
+		0x01, 0x01,
+		0x01,
+		byte(dpi >> 8), byte(dpi),
+		byte(dpi >> 8), byte(dpi),
+		0x00, 0x00,
 	}
 
 	result := make([]byte, 0, len(data)+len(jfif))
-	result = append(result, data[:2]...) // SOI (FF D8)
-	result = append(result, jfif...)     // new JFIF APP0
-	result = append(result, data[2:]...) // rest of file
+	result = append(result, data[:2]...)
+	result = append(result, jfif...)
+	result = append(result, data[2:]...)
 	return result
 }
 
@@ -673,73 +662,56 @@ func savePNGWithDPI(path string, img image.Image) error {
 	}
 	defer f.Close()
 
-	// 编码到缓冲区
 	var buf bytes.Buffer
 	enc := &png.Encoder{CompressionLevel: png.BestCompression}
 	if err := enc.Encode(&buf, img); err != nil {
 		return err
 	}
 
-	// 注入 pHYs chunk（96 DPI = 3780 pixels/meter）
 	data := injectPNGpHYs(buf.Bytes(), TargetDPI)
-
 	_, err = f.Write(data)
 	return err
 }
 
-// injectPNGpHYs 在 PNG 的 IHDR 后插入 pHYs 物理尺寸 chunk
 func injectPNGpHYs(data []byte, dpi int) []byte {
-	// PNG 结构: 8-byte signature + chunks
-	// 每个 chunk: 4B length + 4B type + data + 4B CRC
 	if len(data) < 33 {
 		return data
 	}
 
-	// 检查是否已有 pHYs
 	if bytes.Contains(data, []byte("pHYs")) {
-		// 找到并修改已有的 pHYs
 		idx := bytes.Index(data, []byte("pHYs"))
 		if idx > 0 && idx+13 <= len(data) {
-			ppm := uint32(float64(dpi) / 0.0254)                // DPI -> pixels per meter
-			binary.BigEndian.PutUint32(data[idx+4:idx+8], ppm)  // X
-			binary.BigEndian.PutUint32(data[idx+8:idx+12], ppm) // Y
-			data[idx+12] = 1                                    // unit = meter
-			// 重算 CRC
+			ppm := uint32(float64(dpi) / 0.0254)
+			binary.BigEndian.PutUint32(data[idx+4:idx+8], ppm)
+			binary.BigEndian.PutUint32(data[idx+8:idx+12], ppm)
+			data[idx+12] = 1
 			crc := crc32PNG(data[idx : idx+13])
 			binary.BigEndian.PutUint32(data[idx+13:idx+17], crc)
 		}
 		return data
 	}
 
-	// 构造新的 pHYs chunk
-	ppm := uint32(float64(dpi) / 0.0254) // 96 DPI ≈ 3780 ppm
+	ppm := uint32(float64(dpi) / 0.0254)
 
 	var phys bytes.Buffer
-	// chunk data (9 bytes)
 	chunkData := make([]byte, 9)
-	binary.BigEndian.PutUint32(chunkData[0:4], ppm) // X pixels per unit
-	binary.BigEndian.PutUint32(chunkData[4:8], ppm) // Y pixels per unit
-	chunkData[8] = 1                                // unit = meter
+	binary.BigEndian.PutUint32(chunkData[0:4], ppm)
+	binary.BigEndian.PutUint32(chunkData[4:8], ppm)
+	chunkData[8] = 1
 
-	// length
 	lengthBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(lengthBytes, 9)
 	phys.Write(lengthBytes)
 
-	// type + data
 	typeAndData := append([]byte("pHYs"), chunkData...)
 	phys.Write(typeAndData)
 
-	// CRC over type+data
 	crc := crc32PNG(typeAndData)
 	crcBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(crcBytes, crc)
 	phys.Write(crcBytes)
 
-	// 插入到 IHDR 之后
-	// PNG signature (8 bytes) + IHDR chunk
-	// IHDR chunk: 4B length + 4B "IHDR" + 13B data + 4B CRC = 25 bytes
-	ihdrEnd := 8 + 25 // position after IHDR
+	ihdrEnd := 8 + 25
 
 	if ihdrEnd > len(data) {
 		return data
@@ -752,9 +724,7 @@ func injectPNGpHYs(data []byte, dpi int) []byte {
 	return result
 }
 
-// crc32PNG 计算 PNG chunk 的 CRC32 (使用 ISO 3309 多项式)
 func crc32PNG(data []byte) uint32 {
-	// PNG uses CRC-32/ISO-HDLC
 	var table [256]uint32
 	for i := 0; i < 256; i++ {
 		c := uint32(i)
@@ -789,7 +759,7 @@ func (a *App) placeholder(path string) {
 }
 
 // ============================================================================
-// 9. EPUB CONTAINER OPERATIONS (Streaming)
+// 9. EPUB CONTAINER OPERATIONS
 // ============================================================================
 
 func (a *App) unzipStreaming(src, dest string) error {
@@ -802,7 +772,6 @@ func (a *App) unzipStreaming(src, dest string) error {
 	for _, zf := range r.File {
 		fpath := filepath.Join(dest, zf.Name)
 
-		// Zip Slip 防护
 		if !strings.HasPrefix(filepath.Clean(fpath), filepath.Clean(dest)+string(os.PathSeparator)) {
 			a.log(fmt.Sprintf("⚠️  跳过危险路径: %s", zf.Name))
 			continue
@@ -850,7 +819,6 @@ func (a *App) zipEPUBStrict(srcDir, destFile string) error {
 	w := zip.NewWriter(f)
 	defer w.Close()
 
-	// mimetype 必须排第一且不压缩 (EPUB OCF 规范)
 	mtPath := filepath.Join(srcDir, "mimetype")
 	if mtData, err := os.ReadFile(mtPath); err == nil {
 		header := &zip.FileHeader{
@@ -864,7 +832,6 @@ func (a *App) zipEPUBStrict(srcDir, destFile string) error {
 		writer.Write(bytes.TrimSpace(mtData))
 	}
 
-	// 其余文件流式写入
 	return filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || filepath.Base(path) == "mimetype" {
 			return err
@@ -900,7 +867,7 @@ func (a *App) zipEPUBStrict(srcDir, destFile string) error {
 }
 
 // ============================================================================
-// 10. PDF GENERATION (带圈数字修复)
+// 10. PDF GENERATION — XeLaTeX + xeCJK (①②③ 修复)
 // ============================================================================
 
 func getFontConfig() FontConfig {
@@ -929,7 +896,7 @@ func getFontConfig() FontConfig {
 	}
 }
 
-func (a *App) toPDF(inputEpub, outputPdf, workDir string) error {
+func (a *App) toPDF(inputEpub, outputPdf, workDir, jobID string) error {
 	if _, err := exec.LookPath("pandoc"); err != nil {
 		return fmt.Errorf("Pandoc 未安装")
 	}
@@ -940,30 +907,39 @@ func (a *App) toPDF(inputEpub, outputPdf, workDir string) error {
 	a.log(fmt.Sprintf("🔤 字体: Main=%s CJK=%s Fallback=%s Mono=%s",
 		fc.MainFont, fc.CJKMainFont, fc.CJKFallback, fc.MonoFont))
 
-	// 从 Pandoc 导出默认模板
+	epubInfo, _ := os.Stat(inputEpub)
+	epubSizeMB := float64(epubInfo.Size()) / 1024 / 1024
+
+	useLua := epubSizeMB > 50
+	engine := "xelatex"
+	if useLua {
+		engine = "lualatex"
+	}
+	a.log(fmt.Sprintf("⚙️  引擎: %s (EPUB=%.1fMB, 阈值=50MB)", engine, epubSizeMB))
+
 	templatePath := filepath.Join(workDir, "athanor_template.tex")
-	defaultTemplate, err := a.getPandocDefaultTemplate()
-	if err != nil {
-		a.log(fmt.Sprintf("⚠️  无法获取默认模板，使用内置模板: %v", err))
-		templateContent := buildFallbackTemplate(fc)
-		if writeErr := os.WriteFile(templatePath, []byte(templateContent), 0644); writeErr != nil {
-			return fmt.Errorf("模板写入失败: %w", writeErr)
-		}
+	var templateContent string
+	if useLua {
+		templateContent = buildLuaLaTeXTemplate(fc)
 	} else {
-		// 注入我们的字体配置和圈数字修复到默认模板
-		patchedTemplate := patchDefaultTemplate(defaultTemplate, fc)
-		if writeErr := os.WriteFile(templatePath, []byte(patchedTemplate), 0644); writeErr != nil {
-			return fmt.Errorf("模板写入失败: %w", writeErr)
-		}
+		templateContent = buildXeLaTeXTemplate(fc)
+	}
+	if err := os.WriteFile(templatePath, []byte(templateContent), 0644); err != nil {
+		return fmt.Errorf("模板写入失败: %w", err)
 	}
 
-	a.log(fmt.Sprintf("📝 模板已就绪: %s", templatePath))
+	// ═══ 第 1 步：Pandoc 生成 .tex + 提取媒体到工作目录 ═══
+	texPath := filepath.Join(workDir, "output.tex")
+	mediaDir := workDir // 媒体提取到工作目录根下，这样相对路径匹配
 
-	args := []string{
+	a.log("📝 第1步: Pandoc 生成 LaTeX 源码...")
+	a.progress(jobID, "pdf", 72, "📝 生成 LaTeX 源码...")
+
+	pandocArgs := []string{
 		inputEpub,
-		"-o", outputPdf,
-		"--pdf-engine=xelatex",
+		"-o", texPath,
 		"--template=" + templatePath,
+		"--extract-media=" + mediaDir,
 		"--toc",
 		"--toc-depth=2",
 		"-V", "geometry:margin=1in",
@@ -972,54 +948,263 @@ func (a *App) toPDF(inputEpub, outputPdf, workDir string) error {
 		"-V", fmt.Sprintf("CJKmainfont=%s", fc.CJKMainFont),
 	}
 
-	a.log(fmt.Sprintf("🔧 Pandoc: %s", strings.Join(args, " ")))
-	return a.runPandoc(args)
-}
-
-// getPandocDefaultTemplate 从 Pandoc 导出其自带的 LaTeX 默认模板
-func (a *App) getPandocDefaultTemplate() (string, error) {
-	cmd := exec.Command("pandoc", "-D", "latex")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("pandoc -D latex 失败: %w (%s)", err, stderr.String())
+	a.log(fmt.Sprintf("🔧 Pandoc: %s", strings.Join(pandocArgs, " ")))
+	if err := a.runPandoc(pandocArgs, jobID); err != nil {
+		return fmt.Errorf("Pandoc 生成 tex 失败: %w", err)
 	}
 
-	template := stdout.String()
-	if len(template) < 100 {
-		return "", fmt.Errorf("模板内容过短: %d bytes", len(template))
+	texInfo, err := os.Stat(texPath)
+	if err != nil || texInfo.Size() < 100 {
+		return fmt.Errorf("LaTeX 源码未生成或过小")
+	}
+	a.log(fmt.Sprintf("✅ LaTeX 源码: %.2f MB", float64(texInfo.Size())/1024/1024))
+
+	// ═══ 第 1.5 步：修复 LaTeX 源码 ═══
+	a.progress(jobID, "pdf", 75, "🔧 修复 LaTeX 源码...")
+	if err := a.fixLaTeX(texPath, workDir); err != nil {
+		a.log(fmt.Sprintf("⚠️  LaTeX 修复出错 (继续): %v", err))
 	}
 
-	a.log(fmt.Sprintf("📄 Pandoc 默认模板: %d bytes", len(template)))
-	return template, nil
+	// ═══ 第 2 步：LaTeX 编译 ═══
+	a.log(fmt.Sprintf("📄 第2步: %s 编译 PDF...", engine))
+	a.progress(jobID, "pdf", 78, fmt.Sprintf("📄 %s 编译中...", engine))
+
+	if err := a.runLaTeX(engine, texPath, workDir, jobID); err != nil {
+		return fmt.Errorf("LaTeX 编译失败: %w", err)
+	}
+
+	// ═══ 第 3 步：复制 PDF 到目标 ═══
+	compiledPdf := filepath.Join(workDir, "output.pdf")
+	pdfInfo, err := os.Stat(compiledPdf)
+	if err != nil {
+		return fmt.Errorf("PDF 未生成: %w", err)
+	}
+	if pdfInfo.Size() < 1024 {
+		return fmt.Errorf("PDF 异常小 (%d bytes)", pdfInfo.Size())
+	}
+
+	srcFile, err := os.Open(compiledPdf)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(outputPdf)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+
+	a.log(fmt.Sprintf("✅ PDF 编译完成: %.2f MB", float64(pdfInfo.Size())/1024/1024))
+	return nil
 }
 
-// patchDefaultTemplate 将圈数字修复注入 Pandoc 默认模板
-func patchDefaultTemplate(template string, fc FontConfig) string {
-	circledNumbersFix := `
-% ═══════ ATHANOR: CIRCLED NUMBERS FIX (①②③) ═══════
-\xeCJKDeclareCharClass{CJK}{
-  "2460 -> "24FF,
-  "2600 -> "26FF,
-  "2700 -> "27BF,
-  "3200 -> "32FF
+// fixLaTeX 修复 Pandoc 生成的 LaTeX 中的已知问题
+func (a *App) fixLaTeX(texPath, workDir string) error {
+	data, err := os.ReadFile(texPath)
+	if err != nil {
+		return err
+	}
+
+	content := string(data)
+	fixCount := 0
+
+	// 修复1: longtable 列格式中的非法字符
+	reBadTable := regexp.MustCompile(`\\begin\{longtable\}\[?\]?\{([^}]*)\}`)
+	content = reBadTable.ReplaceAllStringFunc(content, func(match string) string {
+		sub := reBadTable.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		colSpec := sub[1]
+		cleaned := regexp.MustCompile(`[^lrcpmbsd{}@>\\. \d]`).ReplaceAllString(colSpec, "")
+		if cleaned == "" {
+			cleaned = "@{}l@{}"
+		}
+		if cleaned != colSpec {
+			fixCount++
+			return fmt.Sprintf(`\begin{longtable}[]{%s}`, cleaned)
+		}
+		return match
+	})
+
+	// 修复2: 空的 longtable 列规格
+	content = strings.ReplaceAll(content, `\begin{longtable}[]{@{}@{}}`, `\begin{longtable}[]{@{}l@{}}`)
+
+	// 修复3: 图片路径 — 确保所有 includegraphics 路径正确
+	// Pandoc 可能生成相对路径如 Images/xxx.jpeg 或 media/xxx
+	// 需要确保它们相对于工作目录可访问
+	reImg := regexp.MustCompile(`\\includegraphics(\[.*?\])?\{([^}]+)\}`)
+	content = reImg.ReplaceAllStringFunc(content, func(match string) string {
+		sub := reImg.FindStringSubmatch(match)
+		if len(sub) < 3 {
+			return match
+		}
+		opts := sub[1]
+		imgPath := sub[2]
+
+		// 检查原始路径是否存在
+		absPath := imgPath
+		if !filepath.IsAbs(imgPath) {
+			absPath = filepath.Join(workDir, imgPath)
+		}
+
+		if _, err := os.Stat(absPath); err == nil {
+			return match // 路径正确，不改
+		}
+
+		// 尝试在 media 子目录下找
+		mediaPath := filepath.Join(workDir, "media", imgPath)
+		if _, err := os.Stat(mediaPath); err == nil {
+			fixCount++
+			return fmt.Sprintf(`\includegraphics%s{media/%s}`, opts, imgPath)
+		}
+
+		// 尝试只用文件名在整个工作目录中搜索
+		baseName := filepath.Base(imgPath)
+		found := ""
+		filepath.WalkDir(workDir, func(p string, d fs.DirEntry, e error) error {
+			if e != nil || d.IsDir() || found != "" {
+				return nil
+			}
+			if filepath.Base(p) == baseName {
+				rel, _ := filepath.Rel(workDir, p)
+				found = filepath.ToSlash(rel)
+				return filepath.SkipAll
+			}
+			return nil
+		})
+
+		if found != "" {
+			fixCount++
+			return fmt.Sprintf(`\includegraphics%s{%s}`, opts, found)
+		}
+
+		// 找不到就注释掉，避免编译失败
+		fixCount++
+		a.log(fmt.Sprintf("⚠️  找不到图片: %s (已跳过)", imgPath))
+		return fmt.Sprintf(`%% MISSING: \includegraphics%s{%s}`, opts, imgPath)
+	})
+
+	if fixCount > 0 {
+		a.log(fmt.Sprintf("🔧 修复了 %d 处 LaTeX 问题", fixCount))
+	}
+
+	return os.WriteFile(texPath, []byte(content), 0644)
 }
-\setCJKfallbackfamilyfont{\CJKrmdefault}{` + fc.CJKFallback + `}
-% ═══════ END ATHANOR PATCH ═══════
-`
 
-	// strings.Replace 找不到 marker 时安全返回原字符串，无需 if 判断
-	template = strings.Replace(template, `\begin{document}`, circledNumbersFix+"\n"+`\begin{document}`, 1)
+// runLaTeX 直接调用 LaTeX 引擎编译，支持 nonstopmode 容错
+func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
+	for pass := 1; pass <= 2; pass++ {
+		a.log(fmt.Sprintf("📄 %s 第 %d 遍...", engine, pass))
+		if jobID != "" {
+			pct := 78.0 + float64(pass-1)*10.0
+			a.progress(jobID, "pdf", pct, fmt.Sprintf("📄 编译第 %d/2 遍...", pass))
+		}
 
-	return template
+		ctx, cancel := context.WithTimeout(context.Background(), PandocTimeout/2)
+
+		cmd := exec.CommandContext(ctx, engine,
+			"-interaction=nonstopmode",
+			"-output-directory="+workDir,
+			texPath,
+		)
+		cmd.Dir = workDir
+
+		// LaTeX 所有输出都在 stdout，用一个 pipe 捕获
+		stdoutPipe, err := cmd.StdoutPipe()
+		if err != nil {
+			cancel()
+			return err
+		}
+		// stderr 合并到 stdout
+		cmd.Stderr = cmd.Stdout
+
+		if err := cmd.Start(); err != nil {
+			cancel()
+			return fmt.Errorf("%s 启动失败: %w", engine, err)
+		}
+
+		var outputBuf bytes.Buffer
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			buf := make([]byte, 4096)
+			pageRe := regexp.MustCompile(`\[(\d+)`)
+			lastPage := 0
+			lastLogTime := time.Now()
+			for {
+				n, readErr := stdoutPipe.Read(buf)
+				if n > 0 {
+					chunk := string(buf[:n])
+					outputBuf.WriteString(chunk)
+
+					matches := pageRe.FindAllStringSubmatch(chunk, -1)
+					for _, m := range matches {
+						if len(m) > 1 {
+							page := 0
+							fmt.Sscanf(m[1], "%d", &page)
+							if page > lastPage+50 || time.Since(lastLogTime) > 8*time.Second {
+								msg := fmt.Sprintf("📄 第%d遍 · 第 %d 页", pass, page)
+								a.log(msg)
+								if jobID != "" {
+									pct := 78.0 + float64(pass-1)*10.0 + float64(page%500)/500.0*8.0
+									if pct > 95 {
+										pct = 95
+									}
+									a.progress(jobID, "pdf", pct, msg)
+								}
+								lastPage = page
+								lastLogTime = time.Now()
+							}
+						}
+					}
+				}
+				if readErr != nil {
+					break
+				}
+			}
+		}()
+
+		err = cmd.Wait()
+		<-done
+		cancel()
+
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("%s 第%d遍超时", engine, pass)
+		}
+
+		pdfPath := filepath.Join(workDir, "output.pdf")
+		if info, statErr := os.Stat(pdfPath); statErr == nil && info.Size() > 1024 {
+			errCount := countErrors(outputBuf.String())
+			if errCount > 0 {
+				a.log(fmt.Sprintf("⚠️  第%d遍: %d 个非致命错误（已跳过）", pass, errCount))
+			}
+			continue
+		}
+
+		if err != nil {
+			errStr := outputBuf.String()
+			if len(errStr) > 2000 {
+				errStr = errStr[len(errStr)-2000:]
+			}
+			a.log(fmt.Sprintf("❌ %s 第%d遍输出:\n%s", engine, pass, errStr))
+			return fmt.Errorf("%s 第%d遍失败", engine, pass)
+		}
+	}
+
+	return nil
 }
 
-// buildFallbackTemplate 当无法获取 Pandoc 默认模板时使用的后备模板
-func buildFallbackTemplate(fc FontConfig) string {
+// buildXeLaTeXTemplate — XeLaTeX 版（快速，65535页限制）
+func buildXeLaTeXTemplate(fc FontConfig) string {
 	template := `\documentclass[12pt,a4paper]{article}
 
+% ═══════ CORE PACKAGES ═══════
 \usepackage{amsmath,amssymb}
 \usepackage{fontspec}
 \usepackage{xeCJK}
@@ -1030,14 +1215,18 @@ func buildFallbackTemplate(fc FontConfig) string {
 \usepackage{booktabs}
 \usepackage{array}
 \usepackage{xcolor}
-\usepackage{fvextra}
-\usepackage{framed}
-\usepackage{soul}
-\usepackage{calc}
 \usepackage{etoolbox}
 
+% ═══════ OPTIONAL PACKAGES ═══════
+\IfFileExists{caption.sty}{\usepackage{caption}}{}
+\IfFileExists{fvextra.sty}{\usepackage{fvextra}}{\usepackage{fancyvrb}}
+\IfFileExists{framed.sty}{\usepackage{framed}}{}
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+
+% ═══════ PAGE LAYOUT ═══════
 \geometry{a4paper, margin=1in}
 
+% ═══════ FONTS ═══════
 \setmainfont{<<MAINFONT>>}
 \setmonofont{<<MONOFONT>>}[Scale=0.85]
 \setCJKmainfont{<<CJKMAINFONT>>}
@@ -1055,17 +1244,28 @@ func buildFallbackTemplate(fc FontConfig) string {
 \providecommand{\pandocbounded}[1]{#1}
 \providecommand{\tightlist}{%
   \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
-
 \newlength{\cslhangindent}
 \setlength{\cslhangindent}{1.5em}
 \newlength{\csllabelwidth}
 \setlength{\csllabelwidth}{3em}
 \newenvironment{CSLReferences}[2]{}{}
 
+% ═══════ COUNTER FIX ═══════
+\makeatletter
+\@ifundefined{c@none}{\newcounter{none}}{}
+\AtBeginDocument{%
+  \@ifundefined{c@none}{\newcounter{none}}{}%
+  \@ifpackageloaded{caption}{\captionsetup[longtable]{labelformat=empty}}{}%
+}
+\makeatother
+
 % ═══════ SHADED CODE BLOCKS ═══════
 \definecolor{shadecolor}{RGB}{245,245,245}
-\newenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}
-
+\IfFileExists{framed.sty}{%
+  \newenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}
+}{%
+  \newenvironment{Shaded}{\begin{quote}}{\end{quote}}
+}
 \DefineVerbatimEnvironment{Highlighting}{Verbatim}{
   commandchars=\\\{\},
   fontsize=\small,
@@ -1162,82 +1362,32 @@ $body$
 		"<<CJKMAINFONT>>", fc.CJKMainFont,
 		"<<CJKFALLBACK>>", fc.CJKFallback,
 	)
-
 	return replacer.Replace(template)
 }
 
-// ensureLaTeXPackages 检测必需的 LaTeX 包并尝试自动安装缺失的
-func (a *App) ensureLaTeXPackages() {
-	required := []string{
-		"fvextra", "framed", "lineno", "booktabs",
-		"longtable", "xcolor", "etoolbox", "upquote",
-		"fontspec", "xeCJK", "geometry", "graphicx",
-		"hyperref",
-	}
-
-	// kpsewhich 映射：有些包名和 .sty 文件名不同
-	styNames := map[string]string{
-		"xeCJK":    "xeCJK",
-		"graphicx": "graphicx",
-	}
-
-	var missing []string
-	for _, pkg := range required {
-		styName := pkg
-		if mapped, ok := styNames[pkg]; ok {
-			styName = mapped
-		}
-
-		cmd := exec.Command("kpsewhich", styName+".sty")
-		if output, err := cmd.Output(); err != nil || len(strings.TrimSpace(string(output))) == 0 {
-			missing = append(missing, pkg)
-		}
-	}
-
-	if len(missing) == 0 {
-		a.log("✅ LaTeX 依赖检查通过")
-		return
-	}
-
-	a.log(fmt.Sprintf("⚠️  缺失 LaTeX 包: %s", strings.Join(missing, ", ")))
-
-	// 尝试用 tlmgr 安装
-	if _, err := exec.LookPath("tlmgr"); err != nil {
-		a.log("❌ tlmgr 不可用，请手动安装: tlmgr install " + strings.Join(missing, " "))
-		return
-	}
-
-	for _, pkg := range missing {
-		a.log(fmt.Sprintf("📦 安装 %s...", pkg))
-		cmd := exec.Command("tlmgr", "install", pkg)
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			a.log(fmt.Sprintf("⚠️  %s 安装失败: %s", pkg, strings.TrimSpace(stderr.String())))
-		} else {
-			a.log(fmt.Sprintf("✅ %s 已安装", pkg))
-		}
-	}
-}
-
-// buildLaTeXTemplate 生成兼容新旧 xeCJK 的 LaTeX 模板
-// 使用 CJK 类声明将带圈数字归入 CJK 字符类，
-// 再用 setCJKfallbackfamilyfont 指定 Fallback 字体
-
-func buildLaTeXTemplate(fc FontConfig) string {
+// buildLuaLaTeXTemplate 生成纯 LuaLaTeX 模板，无 xeCJK 依赖
+func buildLuaLaTeXTemplate(fc FontConfig) string {
 	template := `\documentclass[12pt,a4paper]{article}
 
-% ═══════ PACKAGES ═══════
+% ═══════ CORE PACKAGES ═══════
+\usepackage{amsmath,amssymb}
 \usepackage{fontspec}
-\usepackage{xeCJK}
+\usepackage{luatexja-fontspec}
 \usepackage{geometry}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{longtable}
 \usepackage{booktabs}
+\usepackage{array}
 \usepackage{xcolor}
-\usepackage{fvextra}
-\usepackage{framed}
+\usepackage{etoolbox}
+\usepackage{luacode}
+
+% ═══════ OPTIONAL PACKAGES (skip if missing) ═══════
+\IfFileExists{caption.sty}{\usepackage{caption}}{}
+\IfFileExists{fvextra.sty}{\usepackage{fvextra}}{\usepackage{fancyvrb}}
+\IfFileExists{framed.sty}{\usepackage{framed}}{}
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
 
 % ═══════ PAGE LAYOUT ═══════
 \geometry{a4paper, margin=1in}
@@ -1246,17 +1396,19 @@ func buildLaTeXTemplate(fc FontConfig) string {
 \setmainfont{<<MAINFONT>>}
 \setmonofont{<<MONOFONT>>}[Scale=0.85]
 
-% ═══════ CJK MAIN FONT ═══════
-\setCJKmainfont{<<CJKMAINFONT>>}
+% ═══════ CJK FONTS (luatexja) ═══════
+\setmainjfont{<<CJKMAINFONT>>}
+\setsansjfont{<<CJKMAINFONT>>}
 
-% ═══════ CIRCLED NUMBERS FIX (①②③) ═══════
-\xeCJKDeclareCharClass{CJK}{
-  "2460 -> "24FF,
-  "2600 -> "26FF,
-  "2700 -> "27BF,
-  "3200 -> "32FF
+% ═══════ CIRCLED NUMBERS FIX (①②③④⑤ etc.) ═══════
+% LuaLaTeX: use luaotfload fallback mechanism
+\directlua{
+  luaotfload.add_fallback("athanorfallback", {
+    "<<CJKFALLBACK>>:mode=harf;",
+    "<<CJKMAINFONT>>:mode=harf;",
+  })
 }
-\setCJKfallbackfamilyfont{\CJKrmdefault}{<<CJKFALLBACK>>}
+\setmainfont{<<MAINFONT>>}[RawFeature={fallback=athanorfallback}]
 
 % ═══════ PANDOC 3.x COMPATIBILITY ═══════
 \providecommand{\pandocbounded}[1]{#1}
@@ -1269,11 +1421,23 @@ func buildLaTeXTemplate(fc FontConfig) string {
 \setlength{\csllabelwidth}{3em}
 \newenvironment{CSLReferences}[2]{}{}
 
+% ═══════ LONGTABLE / COUNTER FIX ═══════
+\makeatletter
+\@ifundefined{c@none}{\newcounter{none}}{}
+\AtBeginDocument{%
+  \@ifundefined{c@none}{\newcounter{none}}{}%
+  \@ifpackageloaded{caption}{\captionsetup[longtable]{labelformat=empty}}{}%
+}
+\makeatother
+
 % ═══════ SHADED CODE BLOCKS ═══════
 \definecolor{shadecolor}{RGB}{245,245,245}
-\newenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}
+\IfFileExists{framed.sty}{%
+  \newenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}
+}{%
+  \newenvironment{Shaded}{\begin{quote}}{\end{quote}}
+}
 
-% fvextra provides breaklines for Verbatim
 \DefineVerbatimEnvironment{Highlighting}{Verbatim}{
   commandchars=\\\{\},
   fontsize=\small,
@@ -1330,7 +1494,7 @@ func buildLaTeXTemplate(fc FontConfig) string {
   bookmarksnumbered=true
 }
 
-% ═══════ PARAGRAPH ═══════
+% ═══════ PARAGRAPH SPACING ═══════
 \setlength{\parskip}{6pt plus 2pt minus 1pt}
 \setlength{\parindent}{0pt}
 \setlength{\emergencystretch}{3em}
@@ -1377,6 +1541,49 @@ $body$
 	return replacer.Replace(template)
 }
 
+// ensureLaTeXPackages 检测必需的 LaTeX 包
+func (a *App) ensureLaTeXPackages() {
+	required := []string{
+		"fvextra", "framed", "booktabs",
+		"longtable", "xcolor", "etoolbox",
+		"fontspec", "xeCJK", "luatexja",
+		"geometry", "graphicx", "hyperref",
+		"amsmath", "amssymb", "luacode",
+	}
+
+	var missing []string
+	for _, pkg := range required {
+		cmd := exec.Command("kpsewhich", pkg+".sty")
+		if output, err := cmd.Output(); err != nil || len(strings.TrimSpace(string(output))) == 0 {
+			missing = append(missing, pkg)
+		}
+	}
+
+	if len(missing) == 0 {
+		a.log("✅ LaTeX 依赖检查通过")
+		return
+	}
+
+	a.log(fmt.Sprintf("⚠️  缺失 LaTeX 包: %s", strings.Join(missing, ", ")))
+
+	if _, err := exec.LookPath("tlmgr"); err != nil {
+		a.log("❌ tlmgr 不可用，请手动安装: tlmgr install " + strings.Join(missing, " "))
+		return
+	}
+
+	for _, pkg := range missing {
+		a.log(fmt.Sprintf("📦 安装 %s...", pkg))
+		cmd := exec.Command("tlmgr", "install", pkg)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			a.log(fmt.Sprintf("⚠️  %s 安装失败: %s", pkg, strings.TrimSpace(stderr.String())))
+		} else {
+			a.log(fmt.Sprintf("✅ %s 已安装", pkg))
+		}
+	}
+}
+
 // ============================================================================
 // 11. MARKDOWN GENERATION (AI-Ready)
 // ============================================================================
@@ -1399,7 +1606,7 @@ func (a *App) toMarkdown(inputEpub, outputMd string) error {
 		return err
 	}
 
-	return a.cleanMarkdown(outputMd)
+	return a.runPandoc(args) // 不传 jobID，保持兼容
 }
 
 func (a *App) cleanMarkdown(path string) error {
@@ -1410,18 +1617,15 @@ func (a *App) cleanMarkdown(path string) error {
 
 	content := string(data)
 
-	// 移除多余空行
 	reBlank := regexp.MustCompile(`\n{3,}`)
 	content = reBlank.ReplaceAllString(content, "\n\n")
 
-	// 移除残留 HTML 标签
 	reDiv := regexp.MustCompile(`</?div[^>]*>`)
 	content = reDiv.ReplaceAllString(content, "")
 	reSpan := regexp.MustCompile(`</?span[^>]*>`)
 	content = reSpan.ReplaceAllString(content, "")
 
-	// 添加元信息
-	header := fmt.Sprintf("<!-- Athanor V4.0 | Generated: %s -->\n\n",
+	header := fmt.Sprintf("<!-- Athanor V4.1 | Generated: %s -->\n\n",
 		time.Now().Format("2006-01-02 15:04:05"))
 	content = header + strings.TrimSpace(content) + "\n"
 
@@ -1432,36 +1636,118 @@ func (a *App) cleanMarkdown(path string) error {
 // 12. PANDOC EXECUTOR
 // ============================================================================
 
-func (a *App) runPandoc(args []string) error {
+func (a *App) runPandoc(args []string, jobID ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), PandocTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "pandoc", args...)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
 
-	err := cmd.Run()
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("启动失败: %w", err)
+	}
+
+	jid := ""
+	if len(jobID) > 0 {
+		jid = jobID[0]
+	}
+
+	var stderrBuf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		pageRe := regexp.MustCompile(`\[(\d+)`)
+		lastPage := 0
+		lastLogTime := time.Now()
+		for {
+			n, readErr := stderrPipe.Read(buf)
+			if n > 0 {
+				chunk := string(buf[:n])
+				stderrBuf.WriteString(chunk)
+
+				matches := pageRe.FindAllStringSubmatch(chunk, -1)
+				for _, m := range matches {
+					if len(m) > 1 {
+						page := 0
+						fmt.Sscanf(m[1], "%d", &page)
+						if page > lastPage+20 || time.Since(lastLogTime) > 5*time.Second {
+							msg := fmt.Sprintf("📄 渲染中... 第 %d 页", page)
+							a.log(msg)
+							if jid != "" {
+								pct := 70.0 + float64(page%1000)/1000.0*25.0
+								if pct > 95 {
+									pct = 95
+								}
+								a.progress(jid, "pdf", pct, msg)
+							}
+							lastPage = page
+							lastLogTime = time.Now()
+						}
+					}
+				}
+			}
+			if readErr != nil {
+				break
+			}
+		}
+	}()
+
+	err = cmd.Wait()
+	<-done
 
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("超时 (%v)", PandocTimeout)
 	}
 
 	if err != nil {
-		errStr := stderr.String()
+		// 检查输出文件是否已生成（LaTeX nonstopmode 可能有错误但仍产出 PDF）
+		outputPdf := extractOutputPath(args)
+		if outputPdf != "" {
+			if info, statErr := os.Stat(outputPdf); statErr == nil && info.Size() > 1024 {
+				a.log(fmt.Sprintf("⚠️  LaTeX 有 %d 个非致命错误，但 PDF 已生成 (%.2f MB)",
+					countErrors(stderrBuf.String()), float64(info.Size())/1024/1024))
+				return nil // PDF 存在且大于 1KB，视为成功
+			}
+		}
+
+		errStr := stderrBuf.String()
 		if len(errStr) > 1500 {
-			errStr = errStr[:1500] + "\n...(truncated)"
+			errStr = errStr[len(errStr)-1500:]
 		}
 		a.log(fmt.Sprintf("❌ Pandoc stderr:\n%s", errStr))
 		return fmt.Errorf("pandoc: %w", err)
 	}
 
-	if stdout.Len() > 0 {
-		a.log(fmt.Sprintf("📤 Pandoc stdout: %s", stdout.String()))
-	}
-
 	return nil
+}
+
+// extractOutputPath 从 pandoc 参数中提取 -o 后的输出路径
+func extractOutputPath(args []string) string {
+	for i, arg := range args {
+		if arg == "-o" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// countErrors 统计 LaTeX 日志中的错误数量
+func countErrors(stderr string) int {
+	count := 0
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(line, "!") {
+			count++
+		}
+	}
+	return count
 }
 
 // ============================================================================

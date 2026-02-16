@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { SelectEpub, ConvertBook, GetLogs } from '../wailsjs/go/main/App';
+import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime';
 import './App.css';
 
 interface ConversionResult {
@@ -18,10 +19,11 @@ function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [isConverting, setIsConverting] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [statusMsg, setStatusMsg] = useState('');
   const terminalRef = useRef<HTMLDivElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── 自动滚动（使用 rAF 确保流畅）──────────────────────────────────
+  // ── 自动滚动 ─────────────────────────────────────────────────────
   useEffect(() => {
     if (terminalRef.current) {
       requestAnimationFrame(() => {
@@ -33,7 +35,24 @@ function App() {
     }
   }, [logs]);
 
-  // ── 日志轮询（转换时启动，完成时停止）─────────────────────────────
+  // ── 监听后端进度事件 ─────────────────────────────────────────────
+  useEffect(() => {
+    const cancelProgress = EventsOn('conversion:progress', (data: ConversionResult) => {
+      if (data && data.progress !== undefined) {
+        setProgress(data.progress);
+      }
+      if (data && data.message) {
+        setStatusMsg(data.message);
+      }
+    });
+
+    return () => {
+      if (typeof cancelProgress === 'function') cancelProgress();
+      EventsOff('conversion:progress');
+    };
+  }, []);
+
+  // ── 日志轮询 ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!isConverting) {
       if (pollRef.current) {
@@ -50,9 +69,9 @@ function App() {
           setLogs(newLogs);
         }
       } catch {
-        // 忽略轮询错误
+        // 忽略
       }
-    }, 150);
+    }, 200);
 
     return () => {
       if (pollRef.current) {
@@ -65,37 +84,38 @@ function App() {
   // ── 转换处理 ─────────────────────────────────────────────────────
   const handleConvert = useCallback(async () => {
     try {
-      // 1. 选择文件
       const filePath = await SelectEpub();
       if (!filePath) return;
 
       setIsConverting(true);
       setProgress(0);
+      setStatusMsg('🚀 任务启动...');
       setLogs(['🚀 任务启动...']);
 
-      // 2. 执行转换（dual output）
       const result = (await ConvertBook(filePath, 'both')) as ConversionResult;
 
-      // 3. 最终拉取日志
       const finalLogs = await GetLogs();
       if (finalLogs && finalLogs.length > 0) {
         setLogs(finalLogs);
       }
 
-      // 4. 显示结果
       if (result.isError) {
+        setProgress(0);
+        setStatusMsg('❌ ' + result.message);
         alert(`❌ 转换失败:\n${result.message}`);
       } else {
+        setProgress(100);
+        setStatusMsg('✅ 转换完成');
         const parts: string[] = ['✅ 转换完成！\n'];
         if (result.pdfPath) parts.push(`📄 PDF: ${result.pdfPath}`);
         if (result.markdownPath) parts.push(`📝 Markdown: ${result.markdownPath}`);
         alert(parts.join('\n'));
       }
     } catch (err) {
+      setStatusMsg('💥 错误');
       alert(`💥 未知错误: ${err}`);
     } finally {
       setIsConverting(false);
-      setProgress(100);
     }
   }, []);
 
@@ -117,9 +137,18 @@ function App() {
           {isConverting ? '🧼 处理中...' : '📚 选择 EPUB 文件'}
         </button>
 
-        {isConverting && (
-          <div className="progress-bar">
-            <div className="progress-fill" style={{ width: `${progress}%` }} />
+        {(isConverting || progress > 0) && (
+          <div className="progress-section">
+            <div className="progress-bar">
+              <div
+                className="progress-fill"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+            <div className="progress-text">
+              <span>{Math.round(progress)}%</span>
+              <span className="status-msg">{statusMsg}</span>
+            </div>
           </div>
         )}
       </div>
@@ -134,17 +163,16 @@ function App() {
   );
 }
 
-// ── 单行日志组件（避免 dangerouslySetInnerHTML 的 XSS 风险）─────────
 function LogLine({ text }: { text: string }) {
   if (!text) return null;
 
-  // 根据内容类型设置样式
   let className = 'log-line';
   if (text.includes('❌')) className += ' log-error';
   else if (text.includes('✅')) className += ' log-success';
   else if (text.includes('⚠️')) className += ' log-warn';
   else if (text.includes('🧼')) className += ' log-sanitize';
   else if (text.includes('🔧')) className += ' log-repair';
+  else if (text.includes('📄 渲染中')) className += ' log-progress';
 
   return <div className={className}>{text}</div>;
 }
