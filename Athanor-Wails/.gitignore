@@ -1,3 +1,23 @@
-build/bin
-node_modules
-frontend/dist
+# --- Wails 核心忽略项 ---
+# 编译产物
+build/bin/
+frontend/dist/
+
+# Wails 依赖安装缓存
+package.json.md5
+
+# --- 前端通用忽略项 ---
+node_modules/
+frontend/node_modules/
+npm-debug.log
+pnpm-debug.log
+yarn-error.log
+
+# --- 系统文件 ---
+.DS_Store
+Thumbs.db
+
+# --- IDE (可选) ---
+.idea/
+.vscode/
+*.swp
