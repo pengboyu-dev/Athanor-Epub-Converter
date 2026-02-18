@@ -4,6 +4,6 @@ import {main} from '../models';
 
 export function ConvertBook(arg1:string,arg2:string):Promise<main.ConversionProgress>;
 
-export function GetLogs():Promise<Array<string>>;
+export function GetLogsSince(arg1:number):Promise<Record<string, any>>;
 
 export function SelectEpub():Promise<string>;
