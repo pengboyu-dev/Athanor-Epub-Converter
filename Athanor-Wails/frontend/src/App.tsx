@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { SelectEpub, ConvertBook, GetLogs } from '../wailsjs/go/main/App';
-import { EventsOn, EventsOff } from '../wailsjs/runtime/runtime';
+import { SelectEpub, ConvertBook, GetLogsSince } from '../wailsjs/go/main/App';
+import { EventsOn } from '../wailsjs/runtime/runtime';
 import './App.css';
+
+// ── Types ──────────────────────────────────────────────────────────
 
 interface ConversionResult {
   jobId: string;
@@ -15,15 +17,31 @@ interface ConversionResult {
   markdownPath?: string;
 }
 
+interface LogLineEvent {
+  seq: number;
+  line: string;
+}
+
+interface LogsSinceResult {
+  lines: string[];
+  nextSeq: number;
+}
+
+// ── Component ──────────────────────────────────────────────────────
+
 function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [isConverting, setIsConverting] = useState(false);
   const [progress, setProgress] = useState(0);
   const [statusMsg, setStatusMsg] = useState('');
   const terminalRef = useRef<HTMLDivElement>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // ── 自动滚动 ─────────────────────────────────────────────────────
+  // Sequence number tracking for incremental log delivery.
+  // We use a ref so the event callback always sees the latest value
+  // without needing to be in the useEffect dependency array.
+  const nextSeqRef = useRef(0);
+
+  // ── Auto-scroll terminal ─────────────────────────────────────────
   useEffect(() => {
     if (terminalRef.current) {
       requestAnimationFrame(() => {
@@ -35,9 +53,42 @@ function App() {
     }
   }, [logs]);
 
-  // ── 监听后端进度事件 ─────────────────────────────────────────────
+  // ── Fetch full log history on mount (backfill) ───────────────────
   useEffect(() => {
-    const cancelProgress = EventsOn('conversion:progress', (data: ConversionResult) => {
+    (async () => {
+      try {
+        const result = (await GetLogsSince(0)) as LogsSinceResult;
+        if (result && result.lines && result.lines.length > 0) {
+          setLogs(result.lines);
+          nextSeqRef.current = result.nextSeq;
+        }
+      } catch {
+        // Backend may not be ready yet — ignore.
+      }
+    })();
+  }, []);
+
+  // ── Subscribe to incremental log events ──────────────────────────
+  useEffect(() => {
+    const cancel = EventsOn('log:line', (data: LogLineEvent) => {
+      if (!data || typeof data.line !== 'string') return;
+
+      // If the incoming seq matches what we expect, just append.
+      // If there is a gap (e.g. we missed events), we will do a
+      // backfill on the next convert cycle. For normal operation
+      // the events arrive in order and this is sufficient.
+      setLogs((prev) => [...prev, data.line]);
+      nextSeqRef.current = data.seq + 1;
+    });
+
+    return () => {
+      if (typeof cancel === 'function') cancel();
+    };
+  }, []);
+
+  // ── Subscribe to conversion progress events ─────────────────────
+  useEffect(() => {
+    const cancel = EventsOn('conversion:progress', (data: ConversionResult) => {
       if (data && data.progress !== undefined) {
         setProgress(data.progress);
       }
@@ -47,41 +98,11 @@ function App() {
     });
 
     return () => {
-      if (typeof cancelProgress === 'function') cancelProgress();
-      EventsOff('conversion:progress');
+      if (typeof cancel === 'function') cancel();
     };
   }, []);
 
-  // ── 日志轮询 ─────────────────────────────────────────────────────
-  useEffect(() => {
-    if (!isConverting) {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-      return;
-    }
-
-    pollRef.current = setInterval(async () => {
-      try {
-        const newLogs = await GetLogs();
-        if (newLogs && newLogs.length > 0) {
-          setLogs(newLogs);
-        }
-      } catch {
-        // 忽略
-      }
-    }, 200);
-
-    return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-    };
-  }, [isConverting]);
-
-  // ── 转换处理 ─────────────────────────────────────────────────────
+  // ── Convert handler ──────────────────────────────────────────────
   const handleConvert = useCallback(async () => {
     try {
       const filePath = await SelectEpub();
@@ -90,13 +111,29 @@ function App() {
       setIsConverting(true);
       setProgress(0);
       setStatusMsg('🚀 任务启动...');
-      setLogs(['🚀 任务启动...']);
+
+      // Backfill any logs we may have missed, then clear and start fresh.
+      try {
+        const backfill = (await GetLogsSince(nextSeqRef.current)) as LogsSinceResult;
+        if (backfill && backfill.lines && backfill.lines.length > 0) {
+          setLogs((prev) => [...prev, ...backfill.lines]);
+          nextSeqRef.current = backfill.nextSeq;
+        }
+      } catch {
+        // Non-critical.
+      }
 
       const result = (await ConvertBook(filePath, 'both')) as ConversionResult;
 
-      const finalLogs = await GetLogs();
-      if (finalLogs && finalLogs.length > 0) {
-        setLogs(finalLogs);
+      // Final backfill to make sure we have every log line.
+      try {
+        const final = (await GetLogsSince(nextSeqRef.current)) as LogsSinceResult;
+        if (final && final.lines && final.lines.length > 0) {
+          setLogs((prev) => [...prev, ...final.lines]);
+          nextSeqRef.current = final.nextSeq;
+        }
+      } catch {
+        // Non-critical.
       }
 
       if (result.isError) {
@@ -124,7 +161,7 @@ function App() {
       <header className="app-header">
         <h1>🔥 ATHANOR</h1>
         <p className="subtitle">
-          EPUB → PDF (人类阅读) + Markdown (AI 阅读)
+          EPUB → PDF（人类阅读）+ Markdown（AI 阅读）
         </p>
       </header>
 
@@ -162,6 +199,8 @@ function App() {
     </div>
   );
 }
+
+// ── Log line component ─────────────────────────────────────────────
 
 function LogLine({ text }: { text: string }) {
   if (!text) return null;

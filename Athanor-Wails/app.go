@@ -32,7 +32,7 @@ import (
 )
 
 // ============================================================================
-// 1. CONSTANTS & CONFIGURATION
+// Constants
 // ============================================================================
 
 const (
@@ -44,18 +44,17 @@ const (
 	StreamBufferSize    = 64 * 1024
 	TargetDPI           = 96
 	JPEGQuality         = 95
-	MaxImageLongSide    = 2500 // 【新增】超过此尺寸的图片将缩小，加速 LaTeX 渲染
+	MaxImageLongSide    = 2500
 )
 
 // ============================================================================
-// 1.5 PACKAGE-LEVEL PRECOMPUTED DATA  【新增】
+// Precomputed data (initialized once at process start)
 // ============================================================================
 
-// CRC32 表只算一次，不再每次调用 crc32PNG 都重建
+// CRC32 lookup table for PNG chunk checksums.
 var crc32PNGTable [256]uint32
 
-// 预编译正则：避免 fixLaTeX 每次调用都 Compile
-
+// Precompiled regexps used by fixLaTeX / cleanMarkdown.
 var (
 	reBadTable = regexp.MustCompile(`\\begin\{longtable\}\[?\]?\{([^}]*)\}`)
 	reCleanCol = regexp.MustCompile(`[^lrcpmbsd{}@>\\. \d]`)
@@ -80,17 +79,23 @@ func init() {
 }
 
 // ============================================================================
-// 2. CORE TYPES
+// Core types
 // ============================================================================
 
+// App is the main backend struct exposed to the Wails frontend.
 type App struct {
-	ctx          context.Context
-	mu           sync.RWMutex
-	logBuffer    []string
+	ctx       context.Context
+	ctxCancel context.CancelFunc // cancel to tear down child processes on shutdown
+
+	mu        sync.RWMutex
+	logBuffer []string
+	logSeq    int // monotonically increasing log sequence number
+
 	currentJobID atomic.Value
 	isProcessing atomic.Bool
 }
 
+// ConversionProgress is emitted to the frontend via Wails events.
 type ConversionProgress struct {
 	JobID        string  `json:"jobId"`
 	Stage        string  `json:"stage"`
@@ -103,6 +108,7 @@ type ConversionProgress struct {
 	PDFPath      string  `json:"pdfPath,omitempty"`
 }
 
+// SanitizationReport describes what happened to a single image file.
 type SanitizationReport struct {
 	FilePath       string   `json:"filePath"`
 	OriginalFormat string   `json:"originalFormat"`
@@ -113,6 +119,7 @@ type SanitizationReport struct {
 	FileSizeAfter  int64    `json:"fileSizeAfter"`
 }
 
+// FontConfig holds platform-specific font names for LaTeX templates.
 type FontConfig struct {
 	MainFont    string
 	CJKMainFont string
@@ -121,7 +128,7 @@ type FontConfig struct {
 }
 
 // ============================================================================
-// 3. LIFECYCLE
+// Lifecycle
 // ============================================================================
 
 func NewApp() *App {
@@ -130,14 +137,35 @@ func NewApp() *App {
 	}
 }
 
+// startup is called by Wails after the window is created.
 func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
+	// Derive a cancellable context so we can kill child processes on shutdown.
+	derivedCtx, cancel := context.WithCancel(ctx)
+	a.ctx = derivedCtx
+	a.ctxCancel = cancel
+
 	a.log("🔥 ATHANOR V4.3 — Optimized Edition")
 	a.log(fmt.Sprintf("⚙️  Platform: %s/%s | CPUs: %d", runtime.GOOS, runtime.GOARCH, runtime.NumCPU()))
 	a.log("🛡️  Protocols: MonsterKiller | DPI-Injector | ①②③-Fix | AI-Markdown")
 	a.log("════════════════════════════════════════════════════════════════")
 }
 
+// Shutdown is called by Wails when the window is closed (register in main.go
+// via OnShutdown). It cancels any running child-process contexts.
+func (a *App) Shutdown(ctx context.Context) {
+	a.log("🛑 应用关闭，清理子进程...")
+	if a.ctxCancel != nil {
+		a.ctxCancel()
+	}
+}
+
+// ============================================================================
+// Logging — incremental event-based approach
+// ============================================================================
+
+// log appends a timestamped message to the ring buffer and emits it to the
+// frontend as an incremental event (with a sequence number so the frontend
+// can detect gaps and request a backfill via GetLogsSince).
 func (a *App) log(msg string) {
 	a.mu.Lock()
 	ts := time.Now().Format("15:04:05.000")
@@ -147,26 +175,57 @@ func (a *App) log(msg string) {
 		a.logBuffer = a.logBuffer[MaxLogLines/5:]
 	}
 	a.logBuffer = append(a.logBuffer, line)
+	seq := a.logSeq
+	a.logSeq++
 	a.mu.Unlock()
 
 	fmt.Println(line)
 
-	// 【优化】只在 ctx 有效时 emit，避免空 goroutine
 	if a.ctx != nil {
-		wailsRuntime.EventsEmit(a.ctx, "log", "INFO||"+msg)
+		wailsRuntime.EventsEmit(a.ctx, "log:line", map[string]interface{}{
+			"seq":  seq,
+			"line": line,
+		})
 	}
 }
 
-func (a *App) GetLogs() []string {
+// GetLogsSince returns all log lines whose sequence number >= `since`.
+// The frontend calls this once on mount (since=0) and again if it detects
+// a gap in the seq numbers it receives via events.
+func (a *App) GetLogsSince(since int) map[string]interface{} {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	out := make([]string, len(a.logBuffer))
-	copy(out, a.logBuffer)
-	return out
+
+	total := a.logSeq // next seq that will be assigned
+	bufLen := len(a.logBuffer)
+
+	// The ring buffer may have been trimmed, so the earliest available seq is:
+	earliest := total - bufLen
+	if earliest < 0 {
+		earliest = 0
+	}
+
+	startIdx := since - earliest
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if startIdx >= bufLen {
+		return map[string]interface{}{
+			"lines":   []string{},
+			"nextSeq": total,
+		}
+	}
+
+	out := make([]string, bufLen-startIdx)
+	copy(out, a.logBuffer[startIdx:])
+	return map[string]interface{}{
+		"lines":   out,
+		"nextSeq": total,
+	}
 }
 
 // ============================================================================
-// 4. FILE SELECTION
+// File selection dialog
 // ============================================================================
 
 func (a *App) SelectEpub() (string, error) {
@@ -201,7 +260,7 @@ func (a *App) SelectEpub() (string, error) {
 }
 
 // ============================================================================
-// 5. MAIN ORCHESTRATOR 【重大重构：消除多余的 rezip 步骤】
+// Main orchestrator
 // ============================================================================
 
 func (a *App) ConvertBook(inputPath string, outputFormat string) ConversionProgress {
@@ -224,7 +283,7 @@ func (a *App) ConvertBook(inputPath string, outputFormat string) ConversionProgr
 	a.progress(jobID, "init", 0, "🚀 初始化转换管道...")
 	a.log(fmt.Sprintf("📤 输出模式: PDF=%v, Markdown=%v", wantPDF, wantMD))
 
-	// ── 1. 验证输入 ───────────────────────────────────────────────
+	// Validate input.
 	inputInfo, err := os.Stat(inputPath)
 	if err != nil {
 		return a.fail(jobID, fmt.Sprintf("文件不可访问: %v", err))
@@ -234,7 +293,7 @@ func (a *App) ConvertBook(inputPath string, outputFormat string) ConversionProgr
 	}
 	a.log(fmt.Sprintf("📖 输入: %s (%.2f MB)", filepath.Base(inputPath), float64(inputInfo.Size())/1024/1024))
 
-	// ── 2. 工作空间 ──────────────────────────────────────────────
+	// Create isolated workspace.
 	a.progress(jobID, "workspace", 5, "🏗️  创建隔离环境...")
 	workDir, err := os.MkdirTemp("", "athanor_v4_*")
 	if err != nil {
@@ -242,17 +301,12 @@ func (a *App) ConvertBook(inputPath string, outputFormat string) ConversionProgr
 	}
 	defer func() {
 		a.log("🧹 清理工作空间...")
-		os.RemoveAll(workDir)
+		if rmErr := os.RemoveAll(workDir); rmErr != nil {
+			a.log(fmt.Sprintf("⚠️  清理失败: %v", rmErr))
+		}
 	}()
 
-	// ────────────────────────────────────────────────────────────────
-	// 【核心优化】新流程：直接用 Pandoc 提取 → 净化 → 编译
-	//   旧: unzip → sanitize → REZIP → Pandoc(UNZIP AGAIN) → LaTeX
-	//   新: Pandoc(extract) → sanitize extracted → LaTeX
-	//   省掉了一次完整 zip 压缩 + Pandoc 内部的重复解压
-	// ────────────────────────────────────────────────────────────────
-
-	// ── 3. PDF ──────────────────────────────────────────────────────
+	// PDF pipeline.
 	if wantPDF {
 		a.progress(jobID, "pdf", 10, "📄 PDF 转换流水线启动...")
 		pdfPath := outputPath(inputPath, "pdf")
@@ -272,7 +326,7 @@ func (a *App) ConvertBook(inputPath string, outputFormat string) ConversionProgr
 		a.log(fmt.Sprintf("✅ PDF: %s (%.2f MB)", filepath.Base(pdfPath), float64(pdfInfo.Size())/1024/1024))
 	}
 
-	// ── 4. Markdown ────────────────────────────────────────────────
+	// Markdown pipeline.
 	if wantMD {
 		a.progress(jobID, "markdown", 90, "📝 生成 AI-Optimized Markdown...")
 		mdPath := outputPath(inputPath, "md")
@@ -284,7 +338,7 @@ func (a *App) ConvertBook(inputPath string, outputFormat string) ConversionProgr
 		}
 	}
 
-	// ── 5. 完成 ──────────────────────────────────────────────────
+	// Final result.
 	if result.PDFPath != "" {
 		result.OutputPath = result.PDFPath
 	} else if result.MarkdownPath != "" {
@@ -300,15 +354,16 @@ func (a *App) ConvertBook(inputPath string, outputFormat string) ConversionProgr
 }
 
 // ============================================================================
-// 6. IMAGE SANITIZATION ENGINE 【并行化 + 快速路径】
+// Image sanitization engine (parallel, with fast path for clean JPEGs)
 // ============================================================================
 
 func (a *App) sanitizeAllImages(dir string) ([]SanitizationReport, error) {
-	// ── 第 1 步：收集所有图片路径 ──
+	// Collect image paths.
 	var imagePaths []string
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			a.log(fmt.Sprintf("⚠️  遍历目录出错: %v", walkErr))
+			return nil // continue walking
 		}
 		if !d.IsDir() && isImageExt(filepath.Ext(path)) {
 			imagePaths = append(imagePaths, path)
@@ -325,8 +380,7 @@ func (a *App) sanitizeAllImages(dir string) ([]SanitizationReport, error) {
 		return nil, nil
 	}
 
-	// ── 第 2 步：并行处理 ──
-	// 【优化】用 worker pool 并行处理，CPU 核心数 cap 到 8 避免内存爆炸
+	// Parallel processing with bounded worker pool.
 	workers := runtime.NumCPU()
 	if workers > total {
 		workers = total
@@ -349,7 +403,6 @@ func (a *App) sanitizeAllImages(dir string) ([]SanitizationReport, error) {
 			for idx := range jobs {
 				reports[idx] = a.sanitizeOne(imagePaths[idx])
 				n := processed.Add(1)
-				// 【优化】只按百分比打日志，避免千条日志刷屏
 				if n%50 == 0 || n == int64(total) {
 					a.log(fmt.Sprintf("🧼 进度: %d/%d (%.0f%%)", n, total,
 						float64(n)/float64(total)*100))
@@ -375,12 +428,12 @@ func (a *App) sanitizeOne(path string) SanitizationReport {
 		r.FileSizeBefore = info.Size()
 	}
 
-	// ── 【新增】快速路径：干净的 JPEG 只改 DPI 字节，跳过 decode/re-encode ──
+	// Fast path: clean JPEG that only needs DPI injection.
 	if fr, ok := a.tryFastPath(path); ok {
 		return *fr
 	}
 
-	// ── 完整路径（需要修复的图像）──
+	// Full path: decode → fix → re-encode.
 	realFmt, err := sniffFormat(path)
 	if err != nil {
 		r.Status = "FAILED"
@@ -420,7 +473,6 @@ func (a *App) sanitizeOne(path string) SanitizationReport {
 		r.Actions = append(r.Actions, act)
 	}
 
-	// 【新增】大图缩小，加速后续 LaTeX 渲染
 	if resized, act := resizeIfNeeded(img); act != "" {
 		img = resized
 		r.Actions = append(r.Actions, act)
@@ -446,24 +498,18 @@ func (a *App) sanitizeOne(path string) SanitizationReport {
 	return r
 }
 
-// tryFastPath — JPEG 快速路径：不解码、不重编码，仅注入 DPI
-// 条件：扩展名匹配 + 真 JPEG + 无需 EXIF 旋转
-// 【新增】对大多数书中的图片（>80% 是干净 JPEG），速度提升 10-50 倍
-
+// tryFastPath handles clean JPEGs: no decode / re-encode, just DPI injection.
 func (a *App) tryFastPath(path string) (*SanitizationReport, bool) {
 	ext := strings.ToLower(filepath.Ext(path))
-
-	// 目前只为 JPEG 做快速路径（EPUB 中最常见的格式）
 	if ext != ".jpg" && ext != ".jpeg" {
 		return nil, false
 	}
 
 	format, err := sniffFormat(path)
 	if err != nil || format != "jpeg" {
-		return nil, false // 格式有问题，走完整路径
+		return nil, false
 	}
 
-	// 有 EXIF 旋转？必须走完整路径
 	if needsExifRotation(path) {
 		return nil, false
 	}
@@ -474,8 +520,6 @@ func (a *App) tryFastPath(path string) (*SanitizationReport, bool) {
 	}
 
 	beforeSize := int64(len(data))
-
-	// 直接在原始字节上注入 JFIF DPI 头
 	newData := injectJFIFDPI(data, TargetDPI)
 
 	tmpPath := path + ".athanor_tmp"
@@ -497,7 +541,7 @@ func (a *App) tryFastPath(path string) (*SanitizationReport, bool) {
 	}, true
 }
 
-// needsExifRotation — 快速检查是否需要 EXIF 旋转（不解码图像）
+// needsExifRotation checks whether EXIF orientation requires pixel rotation.
 func needsExifRotation(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
@@ -507,23 +551,20 @@ func needsExifRotation(path string) bool {
 
 	x, err := exif.Decode(f)
 	if err != nil {
-		return false // 无 EXIF = 无需旋转
+		return false
 	}
-
 	tag, err := x.Get(exif.Orientation)
 	if err != nil {
 		return false
 	}
-
 	orient, err := tag.Int(0)
 	if err != nil {
 		return false
 	}
-
 	return orient > 1
 }
 
-// resizeIfNeeded — 【新增】缩小超大图，加速 LaTeX 编译
+// resizeIfNeeded shrinks images whose longest side exceeds MaxImageLongSide.
 func resizeIfNeeded(img image.Image) (image.Image, string) {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -549,7 +590,7 @@ func resizeIfNeeded(img image.Image) (image.Image, string) {
 }
 
 // ============================================================================
-// 7. IMAGE PRIMITIVES (unchanged except for exported reencode)
+// Image format detection and decoding
 // ============================================================================
 
 func sniffFormat(path string) (string, error) {
@@ -602,6 +643,8 @@ func extToFormat(ext string) string {
 	return ""
 }
 
+// decodeSafe reads image dimensions BEFORE allocating the full pixel buffer,
+// defending against image bombs (e.g. a tiny PNG that decompresses to 10 GB).
 func decodeSafe(path, format string) (image.Image, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -609,11 +652,47 @@ func decodeSafe(path, format string) (image.Image, error) {
 	}
 	defer f.Close()
 
+	// --- Phase 1: read header only to get dimensions (no pixel alloc) ---
+	var cfg image.Config
+	var cfgErr error
+	switch format {
+	case "jpeg":
+		cfg, cfgErr = jpeg.DecodeConfig(f)
+	case "png":
+		cfg, cfgErr = png.DecodeConfig(f)
+	case "gif":
+		cfg, cfgErr = gif.DecodeConfig(f)
+	case "bmp":
+		cfg, cfgErr = bmp.DecodeConfig(f)
+	case "tiff":
+		cfg, cfgErr = tiff.DecodeConfig(f)
+	default:
+		cfg, _, cfgErr = image.DecodeConfig(f)
+	}
+	if cfgErr != nil {
+		return nil, fmt.Errorf("%s config: %w", format, cfgErr)
+	}
+
+	w, h := cfg.Width, cfg.Height
+	if w <= 0 || h <= 0 {
+		return nil, fmt.Errorf("invalid dimensions: %dx%d", w, h)
+	}
+	if w > MaxImageDimension || h > MaxImageDimension {
+		return nil, fmt.Errorf("monster image: %dx%d > %d", w, h, MaxImageDimension)
+	}
+	if int64(w)*int64(h) > MaxPixelCount {
+		return nil, fmt.Errorf("pixel bomb: %dM pixels", int64(w)*int64(h)/1_000_000)
+	}
+
+	// --- Phase 2: seek back and decode the actual pixels ---
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek: %w", err)
+	}
+
 	lr := io.LimitReader(f, MaxDecompressedSize)
 
 	var img image.Image
 	var decErr error
-
 	switch format {
 	case "jpeg":
 		img, decErr = jpeg.Decode(lr)
@@ -628,25 +707,16 @@ func decodeSafe(path, format string) (image.Image, error) {
 	default:
 		img, _, decErr = image.Decode(lr)
 	}
-
 	if decErr != nil {
 		return nil, fmt.Errorf("%s decode: %w", format, decErr)
 	}
 
-	b := img.Bounds()
-	w, h := b.Dx(), b.Dy()
-	if w <= 0 || h <= 0 {
-		return nil, fmt.Errorf("invalid dimensions: %dx%d", w, h)
-	}
-	if w > MaxImageDimension || h > MaxImageDimension {
-		return nil, fmt.Errorf("monster image: %dx%d > %d", w, h, MaxImageDimension)
-	}
-	if int64(w)*int64(h) > MaxPixelCount {
-		return nil, fmt.Errorf("pixel bomb: %dM pixels", int64(w)*int64(h)/1_000_000)
-	}
-
 	return img, nil
 }
+
+// ============================================================================
+// EXIF rotation and color-space normalization
+// ============================================================================
 
 func exifRotate(path string, img image.Image) (image.Image, string) {
 	f, err := os.Open(path)
@@ -659,12 +729,10 @@ func exifRotate(path string, img image.Image) (image.Image, string) {
 	if err != nil {
 		return img, ""
 	}
-
 	tag, err := x.Get(exif.Orientation)
 	if err != nil {
 		return img, ""
 	}
-
 	orient, err := tag.Int(0)
 	if err != nil || orient <= 1 {
 		return img, "EXIF_STRIPPED"
@@ -701,12 +769,12 @@ func toRGB(img image.Image) (image.Image, string) {
 	return rgba, "FORCE_sRGB"
 }
 
-// flattenAlpha 【优化】用类型断言直接访问像素切片，避免接口调度
+// flattenAlpha composites semi-transparent images onto a white background.
+// Uses direct pixel-slice access for performance.
 func flattenAlpha(img image.Image) (image.Image, string) {
 	bounds := img.Bounds()
 	transparent := false
 
-	// 【优化】直接读 Pix 切片，比 img.At(x,y).RGBA() 快 5-10 倍
 	switch v := img.(type) {
 	case *image.NRGBA:
 		pix := v.Pix
@@ -741,7 +809,6 @@ func flattenAlpha(img image.Image) (image.Image, string) {
 			}
 		}
 	default:
-		// 非 RGBA 类型，可能没有 alpha
 		return img, ""
 	}
 
@@ -756,7 +823,7 @@ func flattenAlpha(img image.Image) (image.Image, string) {
 }
 
 // ============================================================================
-// 8. DPI-AWARE RE-ENCODING
+// DPI-aware re-encoding
 // ============================================================================
 
 func reencode(path string, img image.Image, ext string) error {
@@ -827,7 +894,7 @@ func injectJFIFDPI(data []byte, dpi int) []byte {
 	return result
 }
 
-// savePNGWithDPI 【优化】DefaultCompression 替代 BestCompression（快 3-5 倍）
+// savePNGWithDPI uses DefaultCompression (faster than BestCompression).
 func savePNGWithDPI(path string, img image.Image) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -836,7 +903,7 @@ func savePNGWithDPI(path string, img image.Image) error {
 	defer f.Close()
 
 	var buf bytes.Buffer
-	enc := &png.Encoder{CompressionLevel: png.DefaultCompression} // 【改】BestCompression → DefaultCompression
+	enc := &png.Encoder{CompressionLevel: png.DefaultCompression}
 	if err := enc.Encode(&buf, img); err != nil {
 		return err
 	}
@@ -846,25 +913,51 @@ func savePNGWithDPI(path string, img image.Image) error {
 	return err
 }
 
+// injectPNGpHYs walks PNG chunks properly (instead of a raw bytes.Index)
+// to avoid corrupting compressed IDAT data that happens to contain "pHYs".
 func injectPNGpHYs(data []byte, dpi int) []byte {
+	// PNG minimum: 8 (sig) + 25 (IHDR) = 33 bytes.
 	if len(data) < 33 {
 		return data
 	}
 
-	if bytes.Contains(data, []byte("pHYs")) {
-		idx := bytes.Index(data, []byte("pHYs"))
-		if idx > 0 && idx+13 <= len(data) {
-			ppm := uint32(float64(dpi) / 0.0254)
-			binary.BigEndian.PutUint32(data[idx+4:idx+8], ppm)
-			binary.BigEndian.PutUint32(data[idx+8:idx+12], ppm)
-			data[idx+12] = 1
-			crc := crc32PNG(data[idx : idx+13])
-			binary.BigEndian.PutUint32(data[idx+13:idx+17], crc)
+	ppm := uint32(float64(dpi) / 0.0254)
+
+	// Walk chunks starting after the 8-byte PNG signature.
+	offset := 8
+	ihdrEnd := -1
+	for offset+12 <= len(data) {
+		chunkLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
+		chunkType := string(data[offset+4 : offset+8])
+		chunkTotal := 4 + 4 + chunkLen + 4 // length + type + data + crc
+
+		if offset+chunkTotal > len(data) {
+			break // truncated chunk, bail out
 		}
-		return data
+
+		if chunkType == "IHDR" {
+			ihdrEnd = offset + chunkTotal
+		}
+
+		if chunkType == "pHYs" && chunkLen == 9 {
+			// Overwrite existing pHYs chunk data in-place.
+			dataStart := offset + 8 // skip length + type
+			binary.BigEndian.PutUint32(data[dataStart:dataStart+4], ppm)
+			binary.BigEndian.PutUint32(data[dataStart+4:dataStart+8], ppm)
+			data[dataStart+8] = 1 // unit = metre
+			// Recompute CRC over type+data.
+			crc := crc32PNG(data[offset+4 : offset+8+chunkLen])
+			binary.BigEndian.PutUint32(data[offset+8+chunkLen:offset+8+chunkLen+4], crc)
+			return data
+		}
+
+		offset += chunkTotal
 	}
 
-	ppm := uint32(float64(dpi) / 0.0254)
+	// No existing pHYs — insert a new one right after IHDR.
+	if ihdrEnd < 0 || ihdrEnd > len(data) {
+		return data
+	}
 
 	var phys bytes.Buffer
 	chunkData := make([]byte, 9)
@@ -884,11 +977,6 @@ func injectPNGpHYs(data []byte, dpi int) []byte {
 	binary.BigEndian.PutUint32(crcBytes, crc)
 	phys.Write(crcBytes)
 
-	ihdrEnd := 8 + 25
-	if ihdrEnd > len(data) {
-		return data
-	}
-
 	result := make([]byte, 0, len(data)+phys.Len())
 	result = append(result, data[:ihdrEnd]...)
 	result = append(result, phys.Bytes()...)
@@ -896,7 +984,7 @@ func injectPNGpHYs(data []byte, dpi int) []byte {
 	return result
 }
 
-// crc32PNG 【优化】使用预计算的查找表
+// crc32PNG computes CRC-32 using the precomputed lookup table.
 func crc32PNG(data []byte) uint32 {
 	crc := uint32(0xFFFFFFFF)
 	for _, b := range data {
@@ -905,6 +993,7 @@ func crc32PNG(data []byte) uint32 {
 	return crc ^ 0xFFFFFFFF
 }
 
+// placeholder replaces a corrupt image with a harmless SVG.
 func (a *App) placeholder(path string) {
 	svg := `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="400" height="300">
@@ -914,12 +1003,16 @@ func (a *App) placeholder(path string) {
   <text x="200" y="165" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#bbb">Corrupted Image Removed</text>
 </svg>`
 	svgPath := strings.TrimSuffix(path, filepath.Ext(path)) + ".svg"
-	os.WriteFile(svgPath, []byte(svg), 0644)
-	os.Remove(path)
+	if err := os.WriteFile(svgPath, []byte(svg), 0644); err != nil {
+		a.log(fmt.Sprintf("⚠️  写入占位图失败: %v", err))
+	}
+	if err := os.Remove(path); err != nil {
+		a.log(fmt.Sprintf("⚠️  移除损坏图片失败: %v", err))
+	}
 }
 
 // ============================================================================
-// 9. EPUB CONTAINER OPERATIONS
+// EPUB container operations (zip / unzip)
 // ============================================================================
 
 func (a *App) unzipStreaming(src, dest string) error {
@@ -932,6 +1025,7 @@ func (a *App) unzipStreaming(src, dest string) error {
 	for _, zf := range r.File {
 		fpath := filepath.Join(dest, zf.Name)
 
+		// Zip-slip protection.
 		if !strings.HasPrefix(filepath.Clean(fpath), filepath.Clean(dest)+string(os.PathSeparator)) {
 			a.log(fmt.Sprintf("⚠️  跳过危险路径: %s", zf.Name))
 			continue
@@ -989,12 +1083,14 @@ func (a *App) zipEPUBStrict(srcDir, destFile string) error {
 		if err != nil {
 			return err
 		}
-		writer.Write(bytes.TrimSpace(mtData))
+		if _, err := writer.Write(bytes.TrimSpace(mtData)); err != nil {
+			return fmt.Errorf("write mimetype: %w", err)
+		}
 	}
 
-	return filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || filepath.Base(path) == "mimetype" {
-			return err
+	return filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() || filepath.Base(path) == "mimetype" {
+			return walkErr
 		}
 
 		relPath, _ := filepath.Rel(srcDir, path)
@@ -1027,7 +1123,7 @@ func (a *App) zipEPUBStrict(srcDir, destFile string) error {
 }
 
 // ============================================================================
-// 10. PDF GENERATION 【重大重构：消除 rezip，直接 Pandoc→sanitize→LaTeX】
+// PDF generation pipeline
 // ============================================================================
 
 func getFontConfig() FontConfig {
@@ -1056,11 +1152,8 @@ func getFontConfig() FontConfig {
 	}
 }
 
-// ============================================================================
-// 新增：放在 toPDFOptimized 之前
-// ============================================================================
-
-// analyzeEpub 快速扫描 zip 目录（不解压），统计内容复杂度
+// analyzeEpub scans the zip directory (without extracting) to estimate
+// content complexity so we can choose the right LaTeX engine.
 func analyzeEpub(epubPath string) (sizeMB float64, imageCount int, totalTextFiles int) {
 	info, err := os.Stat(epubPath)
 	if err != nil {
@@ -1086,13 +1179,7 @@ func analyzeEpub(epubPath string) (sizeMB float64, imageCount int, totalTextFile
 	return
 }
 
-// toPDFOptimized — 【新架构】
-//
-//	旧流程: unzip → sanitize ALL → rezip → Pandoc(unzip again + gen tex) → LaTeX
-//	新流程: Pandoc(gen tex + extract media) → sanitize ONLY extracted → LaTeX
-//
-// 省掉了一次完整的 zip 压缩和 Pandoc 内部的重复解压。
-// 对大文件（100MB+ EPUB）可节省 30-60 秒。
+// toPDFOptimized runs: Pandoc (gen tex + extract media) → sanitize → fix → compile.
 func (a *App) toPDFOptimized(inputEpub, outputPdf, workDir, jobID string) error {
 	if _, err := exec.LookPath("pandoc"); err != nil {
 		return fmt.Errorf("Pandoc 未安装")
@@ -1104,20 +1191,18 @@ func (a *App) toPDFOptimized(inputEpub, outputPdf, workDir, jobID string) error 
 	a.log(fmt.Sprintf("🔤 字体: Main=%s CJK=%s Fallback=%s Mono=%s",
 		fc.MainFont, fc.CJKMainFont, fc.CJKFallback, fc.MonoFont))
 
-	// ═══ 【修改】智能引擎选择：基于文件大小 + 内容复杂度 ═══
+	// Choose LaTeX engine based on content complexity.
 	epubSizeMB, imageCount, textFiles := analyzeEpub(inputEpub)
 	a.log(fmt.Sprintf("📊 EPUB 分析: %.1fMB, %d 张图片, %d 个文本文件",
 		epubSizeMB, imageCount, textFiles))
 
-	// XeLaTeX 适合：小文件 + 少图 + 少章节
-	// LuaLaTeX 适合：其余所有情况（更稳定，无 65535 页限制）
 	useLua := epubSizeMB > 15 || imageCount > 80 || textFiles > 50
 	engine := "xelatex"
 	if useLua {
 		engine = "lualatex"
 	}
 
-	// 确认所选引擎存在，否则回退
+	// Fall back if the chosen engine is not installed.
 	if _, err := exec.LookPath(engine); err != nil {
 		fallback := "xelatex"
 		if engine == "xelatex" {
@@ -1134,7 +1219,6 @@ func (a *App) toPDFOptimized(inputEpub, outputPdf, workDir, jobID string) error 
 	a.log(fmt.Sprintf("⚙️  引擎: %s (size=%.1fMB imgs=%d texts=%d)",
 		engine, epubSizeMB, imageCount, textFiles))
 
-	// ═══ 【新增】字体缓存预热，避免编译时卡在字体扫描 ═══
 	a.prewarmFontCache(engine)
 
 	templatePath := filepath.Join(workDir, "athanor_template.tex")
@@ -1148,7 +1232,7 @@ func (a *App) toPDFOptimized(inputEpub, outputPdf, workDir, jobID string) error 
 		return fmt.Errorf("模板写入失败: %w", err)
 	}
 
-	// ═══ 第 1 步：Pandoc 生成 .tex + 提取媒体 ═══
+	// Step 1: Pandoc generates .tex and extracts media.
 	texPath := filepath.Join(workDir, "output.tex")
 	mediaDir := workDir
 
@@ -1166,7 +1250,6 @@ func (a *App) toPDFOptimized(inputEpub, outputPdf, workDir, jobID string) error 
 		"-V", fmt.Sprintf("mainfont=%s", fc.MainFont),
 		"-V", fmt.Sprintf("monofont=%s", fc.MonoFont),
 		"-V", fmt.Sprintf("CJKmainfont=%s", fc.CJKMainFont),
-		// ═══ 【修改】强制清除日期，避免标题页出现时间戳 ═══
 		"-M", "date=",
 	}
 
@@ -1180,32 +1263,32 @@ func (a *App) toPDFOptimized(inputEpub, outputPdf, workDir, jobID string) error 
 	}
 	a.log(fmt.Sprintf("✅ LaTeX 源码: %.2f MB", float64(texInfo.Size())/1024/1024))
 
-	// ═══ 第 2 步：净化提取的媒体 ═══
+	// Step 2: Sanitize extracted media.
 	a.progress(jobID, "sanitize", 30, "🧼 并行图像净化...")
 	extractedMediaDir := filepath.Join(workDir, "media")
 	if _, err := os.Stat(extractedMediaDir); err == nil {
-		reports, err := a.sanitizeAllImages(extractedMediaDir)
-		if err != nil {
-			a.log(fmt.Sprintf("⚠️  净化出错 (继续): %v", err))
+		reports, sErr := a.sanitizeAllImages(extractedMediaDir)
+		if sErr != nil {
+			a.log(fmt.Sprintf("⚠️  净化出错 (继续): %v", sErr))
 		} else {
 			a.printSanitizeStats(reports)
 		}
 	} else {
-		reports, err := a.sanitizeAllImages(workDir)
-		if err != nil {
-			a.log(fmt.Sprintf("⚠️  净化出错 (继续): %v", err))
+		reports, sErr := a.sanitizeAllImages(workDir)
+		if sErr != nil {
+			a.log(fmt.Sprintf("⚠️  净化出错 (继续): %v", sErr))
 		} else if len(reports) > 0 {
 			a.printSanitizeStats(reports)
 		}
 	}
 
-	// ═══ 第 3 步：修复 LaTeX ═══
+	// Step 3: Fix LaTeX source.
 	a.progress(jobID, "pdf", 55, "🔧 修复 LaTeX 源码...")
 	if err := a.fixLaTeX(texPath, workDir); err != nil {
 		a.log(fmt.Sprintf("⚠️  LaTeX 修复出错 (继续): %v", err))
 	}
 
-	// ═══ 第 4 步：编译 ═══
+	// Step 4: Compile.
 	a.log(fmt.Sprintf("📄 第4步: %s 编译 PDF...", engine))
 	a.progress(jobID, "pdf", 60, fmt.Sprintf("📄 %s 编译中...", engine))
 
@@ -1213,7 +1296,7 @@ func (a *App) toPDFOptimized(inputEpub, outputPdf, workDir, jobID string) error 
 		return fmt.Errorf("LaTeX 编译失败: %w", err)
 	}
 
-	// ═══ 第 5 步：复制 PDF ═══
+	// Step 5: Copy PDF to output location.
 	compiledPdf := filepath.Join(workDir, "output.pdf")
 	pdfInfo, err := os.Stat(compiledPdf)
 	if err != nil {
@@ -1243,7 +1326,8 @@ func (a *App) toPDFOptimized(inputEpub, outputPdf, workDir, jobID string) error 
 	return nil
 }
 
-// fixLaTeX 【优化】一次性构建图片路径索引，避免每个缺失图片都 WalkDir
+// fixLaTeX patches common issues in Pandoc-generated LaTeX.
+// Builds an image-path index once (O(n)) instead of walking per missing image.
 func (a *App) fixLaTeX(texPath, workDir string) error {
 	data, err := os.ReadFile(texPath)
 	if err != nil {
@@ -1253,7 +1337,7 @@ func (a *App) fixLaTeX(texPath, workDir string) error {
 	content := string(data)
 	fixCount := 0
 
-	// 修复1: longtable 列格式（使用预编译正则）
+	// Fix 1: Clean up broken longtable column specs.
 	content = reBadTable.ReplaceAllStringFunc(content, func(match string) string {
 		sub := reBadTable.FindStringSubmatch(match)
 		if len(sub) < 2 {
@@ -1273,20 +1357,23 @@ func (a *App) fixLaTeX(texPath, workDir string) error {
 
 	content = strings.ReplaceAll(content, `\begin{longtable}[]{@{}@{}}`, `\begin{longtable}[]{@{}l@{}}`)
 
-	// 【优化】一次性建立 文件名→相对路径 索引
+	// Build filename → relative-path index for image lookup.
 	imageIndex := make(map[string]string)
-	filepath.WalkDir(workDir, func(p string, d fs.DirEntry, e error) error {
-		if e != nil || d.IsDir() {
+	if walkErr := filepath.WalkDir(workDir, func(p string, d fs.DirEntry, e error) error {
+		if e != nil {
+			a.log(fmt.Sprintf("⚠️  遍历工作目录出错: %v", e))
 			return nil
 		}
-		if isImageExt(filepath.Ext(p)) {
+		if !d.IsDir() && isImageExt(filepath.Ext(p)) {
 			rel, _ := filepath.Rel(workDir, p)
 			imageIndex[filepath.Base(p)] = filepath.ToSlash(rel)
 		}
 		return nil
-	})
+	}); walkErr != nil {
+		a.log(fmt.Sprintf("⚠️  构建图片索引失败: %v", walkErr))
+	}
 
-	// 修复3: 图片路径（使用预编译正则 + 索引查找）
+	// Fix 2: Repair broken image paths.
 	content = reImg.ReplaceAllStringFunc(content, func(match string) string {
 		sub := reImg.FindStringSubmatch(match)
 		if len(sub) < 3 {
@@ -1310,7 +1397,6 @@ func (a *App) fixLaTeX(texPath, workDir string) error {
 			return fmt.Sprintf(`\includegraphics%s{media/%s}`, opts, imgPath)
 		}
 
-		// 【优化】用索引 O(1) 查找，替代原来的 WalkDir O(n)
 		baseName := filepath.Base(imgPath)
 		if found, ok := imageIndex[baseName]; ok {
 			fixCount++
@@ -1328,11 +1414,16 @@ func (a *App) fixLaTeX(texPath, workDir string) error {
 	return os.WriteFile(texPath, []byte(content), 0644)
 }
 
+// runLaTeX compiles the .tex file with the chosen engine (xelatex / lualatex).
+// Uses a derived context from a.ctx so child processes are killed on app shutdown.
 func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 	pageRe := regexp.MustCompile(`\[(\d+)`)
 
-	// ═══ 动态超时 ═══
-	texInfo, _ := os.Stat(texPath)
+	// Dynamic per-pass timeout based on .tex size.
+	texInfo, err := os.Stat(texPath)
+	if err != nil {
+		return fmt.Errorf("cannot stat tex file: %w", err)
+	}
 	texSizeMB := float64(texInfo.Size()) / 1024 / 1024
 	perPassTimeout := time.Duration(texSizeMB*3+5) * time.Minute
 	if perPassTimeout > 90*time.Minute {
@@ -1341,13 +1432,10 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 	if perPassTimeout < 8*time.Minute {
 		perPassTimeout = 8 * time.Minute
 	}
-
-	// LuaLaTeX 本身就比 XeLaTeX 慢 2-3 倍
 	if engine == "lualatex" {
 		perPassTimeout = perPassTimeout * 2
 	}
 
-	// ═══ 卡死检测超时：LuaLaTeX 给 5 分钟，XeLaTeX 给 3 分钟 ═══
 	stallTimeout := 3 * time.Minute
 	if engine == "lualatex" {
 		stallTimeout = 5 * time.Minute
@@ -1359,11 +1447,7 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 	for pass := 1; pass <= 2; pass++ {
 		a.log(fmt.Sprintf("📄 %s 第 %d 遍...", engine, pass))
 
-		// ═══ 【关键优化】第一遍用 draftmode ═══
-		// draftmode 跳过所有图片处理和 PDF 生成，只建立交叉引用
-		// 速度提升 5-10 倍，这是标准 LaTeX 优化
 		isDraft := (pass == 1)
-
 		if isDraft {
 			a.log("⚡ 第1遍: draft 模式 (跳过图片处理，仅建立引用)")
 		} else {
@@ -1372,11 +1456,16 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 
 		if jobID != "" {
 			pct := 60.0 + float64(pass-1)*15.0
-			a.progress(jobID, "pdf", pct, fmt.Sprintf("📄 编译第 %d/2 遍%s...",
-				pass, map[bool]string{true: " (快速)", false: ""}[isDraft]))
+			label := ""
+			if isDraft {
+				label = " (快速)"
+			}
+			a.progress(jobID, "pdf", pct, fmt.Sprintf("📄 编译第 %d/2 遍%s...", pass, label))
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), perPassTimeout)
+		// Derive timeout context from a.ctx (not context.Background) so that
+		// app shutdown cancels child processes.
+		ctx, cancel := context.WithTimeout(a.ctx, perPassTimeout)
 
 		args := []string{
 			"-interaction=nonstopmode",
@@ -1389,11 +1478,12 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 
 		cmd := exec.CommandContext(ctx, engine, args...)
 		cmd.Dir = workDir
+		hideCmdWindow(cmd)
 
-		stdoutPipe, err := cmd.StdoutPipe()
-		if err != nil {
+		stdoutPipe, pipeErr := cmd.StdoutPipe()
+		if pipeErr != nil {
 			cancel()
-			return err
+			return pipeErr
 		}
 		cmd.Stderr = cmd.Stdout
 
@@ -1402,14 +1492,13 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 			return fmt.Errorf("%s 启动失败: %w", engine, err)
 		}
 
-		// ═══ 【修复】正确的卡死检测：独立 watchdog goroutine ═══
 		var lastActivity atomic.Value
 		lastActivity.Store(time.Now())
 
 		var outputBuf bytes.Buffer
 		readDone := make(chan struct{})
 
-		// 读取 goroutine
+		// Reader goroutine.
 		go func() {
 			defer close(readDone)
 			buf := make([]byte, 4096)
@@ -1421,7 +1510,7 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 				if n > 0 {
 					chunk := string(buf[:n])
 					outputBuf.WriteString(chunk)
-					lastActivity.Store(time.Now()) // 任何输出都重置计时器
+					lastActivity.Store(time.Now())
 
 					matches := pageRe.FindAllStringSubmatch(chunk, -1)
 					for _, m := range matches {
@@ -1450,8 +1539,7 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 			}
 		}()
 
-		// ═══ 【新增】独立 watchdog goroutine ═══
-		// 不依赖 Read() 返回，每 10 秒主动检查一次
+		// Watchdog goroutine — kills process if stalled.
 		watchdogDone := make(chan struct{})
 		go func() {
 			defer close(watchdogDone)
@@ -1466,7 +1554,7 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 					if silent > stallTimeout {
 						a.log(fmt.Sprintf("⚠️  %s 第%d遍卡死 (%.0f分钟无输出)，强制终止",
 							engine, pass, silent.Minutes()))
-						cancel() // 触发 CommandContext 杀进程
+						cancel()
 						return
 					}
 					if silent > 1*time.Minute {
@@ -1474,14 +1562,14 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 							engine, pass, silent.Seconds()))
 					}
 				case <-readDone:
-					return // 正常结束
+					return
 				case <-ctx.Done():
 					return
 				}
 			}
 		}()
 
-		err = cmd.Wait()
+		waitErr := cmd.Wait()
 		<-readDone
 		<-watchdogDone
 		cancel()
@@ -1490,17 +1578,20 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 			return fmt.Errorf("%s 第%d遍超时/卡死", engine, pass)
 		}
 
-		// draft 模式不产生 PDF，只检查是否有致命错误
+		// If app is shutting down, abort immediately.
+		if a.ctx.Err() != nil {
+			return fmt.Errorf("应用关闭，编译中止")
+		}
+
 		if isDraft {
 			errCount := countErrors(outputBuf.String())
 			if errCount > 0 {
 				a.log(fmt.Sprintf("⚠️  第%d遍(draft): %d 个非致命错误", pass, errCount))
 			}
-			// draft 模式即使有错也继续第二遍
 			continue
 		}
 
-		// 第二遍检查 PDF 输出
+		// Second pass: check that a PDF was actually produced.
 		pdfPath := filepath.Join(workDir, "output.pdf")
 		if info, statErr := os.Stat(pdfPath); statErr == nil && info.Size() > 1024 {
 			errCount := countErrors(outputBuf.String())
@@ -1510,7 +1601,7 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 			continue
 		}
 
-		if err != nil {
+		if waitErr != nil {
 			errStr := outputBuf.String()
 			if len(errStr) > 2000 {
 				errStr = errStr[len(errStr)-2000:]
@@ -1522,6 +1613,10 @@ func (a *App) runLaTeX(engine, texPath, workDir, jobID string) error {
 
 	return nil
 }
+
+// ============================================================================
+// LaTeX templates
+// ============================================================================
 
 func buildXeLaTeXTemplate(fc FontConfig) string {
 	template := `\documentclass[12pt,a4paper]{article}
@@ -1562,11 +1657,10 @@ func buildXeLaTeXTemplate(fc FontConfig) string {
 }
 \setCJKfallbackfamilyfont{\CJKrmdefault}{<<CJKFALLBACK>>}
 
-% ═══════ 【改】图片居中 ═══════
+% ═══════ IMAGE CENTERING ═══════
 \makeatletter
 \g@addto@macro\@floatboxreset{\centering}
 \makeatother
-% Pandoc 3.x 独立图片居中
 \providecommand{\pandocbounded}[1]{\begin{center}#1\end{center}}
 
 % ═══════ PANDOC 3.x COMPATIBILITY ═══════
@@ -1661,7 +1755,6 @@ $endif$
 $if(author)$
 \author{$for(author)$$author$$sep$ \and $endfor$}
 $endif$
-% ═══════ 【改】强制无日期，避免 EPUB metadata 中的时间戳出现在标题页 ═══════
 \date{}
 $if(title)$
 \maketitle
@@ -1723,10 +1816,9 @@ func buildLuaLaTeXTemplate(fc FontConfig) string {
 \setmainjfont{<<CJKMAINFONT>>}
 \setsansjfont{<<CJKMAINFONT>>}
 
-% ═══════ SYMBOL FALLBACK (no luaotfload.add_fallback) ═══════
+% ═══════ SYMBOL FALLBACK ═══════
 \ltjsetparameter{jacharrange={-2}}
 \newjfontfamily\symboljfont{<<CJKFALLBACK>>}
-% Use hex code "2460 instead of backtick-① to avoid Go raw string issues
 \ltjsetparameter{alxspmode={"2460,allow}}
 \ltjsetparameter{alxspmode={"2461,allow}}
 \ltjsetparameter{alxspmode={"2462,allow}}
@@ -1902,7 +1994,7 @@ func (a *App) ensureLaTeXPackages() {
 }
 
 // ============================================================================
-// 11. MARKDOWN GENERATION 【修复：移除重复的 Pandoc 调用 + 接入 cleanMarkdown】
+// Markdown generation
 // ============================================================================
 
 func (a *App) toMarkdown(inputEpub, outputMd string) error {
@@ -1919,12 +2011,10 @@ func (a *App) toMarkdown(inputEpub, outputMd string) error {
 
 	a.log(fmt.Sprintf("🔧 Markdown: %s", strings.Join(args, " ")))
 
-	// 【Bug 修复】原代码调用了两次 runPandoc，这里只调用一次
 	if err := a.runPandoc(args); err != nil {
 		return err
 	}
 
-	// 【Bug 修复】cleanMarkdown 原来定义了但从未调用
 	return a.cleanMarkdown(outputMd)
 }
 
@@ -1935,8 +2025,6 @@ func (a *App) cleanMarkdown(path string) error {
 	}
 
 	content := string(data)
-
-	// 使用预编译正则
 	content = reBlankMD.ReplaceAllString(content, "\n\n")
 	content = reDivMD.ReplaceAllString(content, "")
 	content = reSpanMD.ReplaceAllString(content, "")
@@ -1949,14 +2037,19 @@ func (a *App) cleanMarkdown(path string) error {
 }
 
 // ============================================================================
-// 12. PANDOC EXECUTOR
+// Pandoc executor
 // ============================================================================
 
+// runPandoc executes Pandoc with the given arguments. The process context is
+// derived from a.ctx so it is killed on app shutdown. On non-zero exit, the
+// function no longer silently returns nil just because an output file > 1KB
+// exists — it also checks the exit code severity and logs stderr details.
 func (a *App) runPandoc(args []string, jobID ...string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), PandocTimeout)
+	ctx, cancel := context.WithTimeout(a.ctx, PandocTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "pandoc", args...)
+	hideCmdWindow(cmd)
 
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
@@ -2016,29 +2109,58 @@ func (a *App) runPandoc(args []string, jobID ...string) error {
 		}
 	}()
 
-	err = cmd.Wait()
+	waitErr := cmd.Wait()
 	<-done
 
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("超时 (%v)", PandocTimeout)
 	}
 
-	if err != nil {
+	// If app is shutting down, abort.
+	if a.ctx.Err() != nil {
+		return fmt.Errorf("应用关闭，Pandoc 中止")
+	}
+
+	if waitErr != nil {
+		stderrStr := stderrBuf.String()
+		numErrors := countErrors(stderrStr)
+
+		// Check if output file was produced despite the error.
 		outputPdf := extractOutputPath(args)
 		if outputPdf != "" {
 			if info, statErr := os.Stat(outputPdf); statErr == nil && info.Size() > 1024 {
-				a.log(fmt.Sprintf("⚠️  LaTeX 有 %d 个非致命错误，但 PDF 已生成 (%.2f MB)",
-					countErrors(stderrBuf.String()), float64(info.Size())/1024/1024))
-				return nil
+				// Determine exit code if possible.
+				exitCode := 0
+				if exitErr, ok := waitErr.(*exec.ExitError); ok {
+					exitCode = exitErr.ExitCode()
+				}
+
+				// Exit code 1 with a real output file is typically just warnings.
+				// Exit code >= 2 indicates a real failure — do not silently swallow.
+				if exitCode <= 1 {
+					a.log(fmt.Sprintf("⚠️  Pandoc 退出码 %d, %d 个非致命错误, 但输出已生成 (%.2f MB)",
+						exitCode, numErrors, float64(info.Size())/1024/1024))
+					// Log the tail of stderr so the user can investigate if needed.
+					if len(stderrStr) > 0 {
+						tail := stderrStr
+						if len(tail) > 500 {
+							tail = tail[len(tail)-500:]
+						}
+						a.log(fmt.Sprintf("⚠️  Pandoc stderr (尾部):\n%s", tail))
+					}
+					return nil
+				}
+
+				// exitCode >= 2: real error even though a file was produced.
+				a.log(fmt.Sprintf("❌ Pandoc 退出码 %d — 即使有输出文件也视为失败", exitCode))
 			}
 		}
 
-		errStr := stderrBuf.String()
-		if len(errStr) > 1500 {
-			errStr = errStr[len(errStr)-1500:]
+		if len(stderrStr) > 1500 {
+			stderrStr = stderrStr[len(stderrStr)-1500:]
 		}
-		a.log(fmt.Sprintf("❌ Pandoc stderr:\n%s", errStr))
-		return fmt.Errorf("pandoc: %w", err)
+		a.log(fmt.Sprintf("❌ Pandoc stderr:\n%s", stderrStr))
+		return fmt.Errorf("pandoc: %w", waitErr)
 	}
 
 	return nil
@@ -2064,7 +2186,7 @@ func countErrors(stderr string) int {
 }
 
 // ============================================================================
-// 13. UTILITIES
+// Utilities
 // ============================================================================
 
 func isImageExt(ext string) bool {
@@ -2134,8 +2256,8 @@ func (a *App) printSanitizeStats(reports []SanitizationReport) {
 	a.log("╚════════════════════════════════════════════════════╝")
 }
 
-// prewarmFontCache — LuaLaTeX 首次运行 luaotfload 会扫描全部字体，极慢
-// 提前跑一次，后续编译直接命中缓存
+// prewarmFontCache runs luaotfload-tool --update before compilation so that
+// the first LuaLaTeX pass does not stall on a cold font cache.
 func (a *App) prewarmFontCache(engine string) {
 	if engine != "lualatex" {
 		return
@@ -2148,10 +2270,11 @@ func (a *App) prewarmFontCache(engine string) {
 	}
 
 	a.log("🔤 预热 LuaLaTeX 字体缓存...")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(a.ctx, 3*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, toolPath, "--update", "--force")
+	hideCmdWindow(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		a.log(fmt.Sprintf("⚠️  字体缓存预热失败 (非致命): %v", err))
