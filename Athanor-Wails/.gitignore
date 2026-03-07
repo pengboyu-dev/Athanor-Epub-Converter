@@ -21,3 +21,24 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# --- 本地测试缓存 ---
+.gocache/
+.gomodcache/
+.gotmp/
+.tmp/
+app.go.*
+
+# --- 本地生成产物 ---
+*.exe
+core-go-code.txt
+
+# --- 本地资料/样本 ---
+claude-guide-v*.md
+epub-raw/
+
+# --- 编辑临时备份 ---
+*.go.[0-9]*
+
+core_go_code.mjs
+internal/rag/testdata/
