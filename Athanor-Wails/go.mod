@@ -3,10 +3,7 @@ module Athanor-Wails
 go 1.24.0
 
 require (
-	github.com/disintegration/imaging v1.6.2
-	github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd
 	github.com/wailsapp/wails/v2 v2.11.0
-	golang.org/x/image v0.36.0
 	golang.org/x/net v0.35.0
 )
 

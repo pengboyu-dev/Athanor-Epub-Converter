@@ -13,7 +13,6 @@ interface ConversionResult {
   isComplete: boolean;
   isError: boolean;
   outputPath?: string;
-  pdfPath?: string;
   markdownPath?: string;
 }
 
@@ -123,7 +122,7 @@ function App() {
         // Non-critical.
       }
 
-      const result = (await ConvertBook(filePath, 'both')) as ConversionResult;
+      const result = (await ConvertBook(filePath, 'rag-md')) as ConversionResult;
 
       // Final backfill to make sure we have every log line.
       try {
@@ -144,7 +143,6 @@ function App() {
         setProgress(100);
         setStatusMsg('✅ 转换完成');
         const parts: string[] = ['✅ 转换完成！\n'];
-        if (result.pdfPath) parts.push(`📄 PDF: ${result.pdfPath}`);
         if (result.markdownPath) parts.push(`📝 Markdown: ${result.markdownPath}`);
         alert(parts.join('\n'));
       }
@@ -161,7 +159,7 @@ function App() {
       <header className="app-header">
         <h1>🔥 ATHANOR</h1>
         <p className="subtitle">
-          EPUB → PDF（人类阅读）+ Markdown（AI 阅读）
+          EPUB → RAG 高质量 Markdown
         </p>
       </header>
 
@@ -171,7 +169,7 @@ function App() {
           disabled={isConverting}
           className="convert-btn"
         >
-          {isConverting ? '🧼 处理中...' : '📚 选择 EPUB 文件'}
+          {isConverting ? '🧱 转换中...' : '📚 选择 EPUB 文件'}
         </button>
 
         {(isConverting || progress > 0) && (

@@ -9,7 +9,6 @@ export namespace main {
 	    isError: boolean;
 	    outputPath?: string;
 	    markdownPath?: string;
-	    pdfPath?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new ConversionProgress(source);
@@ -25,7 +24,6 @@ export namespace main {
 	        this.isError = source["isError"];
 	        this.outputPath = source["outputPath"];
 	        this.markdownPath = source["markdownPath"];
-	        this.pdfPath = source["pdfPath"];
 	    }
 	}
 
