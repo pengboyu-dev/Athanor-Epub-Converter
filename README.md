@@ -1,71 +1,81 @@
-﻿# Athanor Epub Converter
+# Athanor EPUB Converter
 
-📘 EPUB -> RAG Markdown 转换器。
+[简体中文](./README.zh-CN.md) · [MIT License](./LICENSE)
 
-这个仓库当前聚焦一件事：把 EPUB 转成适合检索、知识库和后续加工的干净 Markdown 原料，而不是继续走旧的 PDF / LaTeX / Pandoc 链路。
+📘 Convert EPUB into RAG-ready Markdown.
+
+Athanor EPUB Converter focuses on one thing: turning EPUB files into clean Markdown for retrieval, knowledge bases, and downstream processing, instead of continuing along older PDF / LaTeX / Pandoc-oriented pipelines.
+
+## Overview
+
+This project is designed for EPUB-to-Markdown conversion workflows where the goal is clean, structured, retrieval-ready text rather than layout-oriented publishing output.
 
 ## Current Focus
 
-- 解析 EPUB 容器、OPF、NCX / Nav TOC
-- 将内容组织为 `main / frontmatter / backmatter`
-- 清洗目录残留、重复块和脚注噪音
-- 输出干净主 Markdown、章节 Markdown、`chunks.jsonl`
-- 生成 `diagnostics.json` 与 `debug.md` 便于排查
-- 提供批量回归基线和最小检索评测
+- Parse EPUB containers, OPF, and NCX / Nav TOC
+- Organize content into `main / frontmatter / backmatter`
+- Clean TOC residue, duplicate blocks, and footnote noise
+- Output clean main Markdown, chapter Markdown, and `chunks.jsonl`
+- Generate `diagnostics.json` and `debug.md` for troubleshooting
+- Provide batch regression baselines and minimal retrieval evaluation
 
 ## Repository Layout
 
 ```text
 Athanor-Wails/
-  app.go                         Wails 壳层
-  main.go                        应用入口
-  internal/rag/                  EPUB -> RAG Markdown 核心链路
-  cmd/build-regression-baseline/ 批量基线生成器
-  frontend/                      Wails 前端
+  app.go                         Wails shell layer
+  main.go                        Application entry
+  internal/rag/                  Core EPUB -> RAG Markdown pipeline
+  cmd/build-regression-baseline/ Batch baseline generator
+  frontend/                      Wails frontend
 ```
 
 ## Outputs
 
-一次转换会生成这些主要产物：
+A single conversion produces the following main artifacts:
 
-- `<BaseName>.md`
-  干净主文档，默认不给正文混入产品标记、路径、哈希或调试注释
-- `<BaseName>/chapters/*.md`
-  按章节拆开的 Markdown
-- `<BaseName>/chunks.jsonl`
-  面向 RAG 的分块结果
-- `<BaseName>/diagnostics.json`
-  统计与异常告警
-- `<BaseName>/debug.md`
-  仅供排查问题使用的调试导出
+- `<BaseName>.md`  
+  Clean primary document. By default, the main body is kept free of product markers, paths, hashes, or debug annotations.
+
+- `<BaseName>/chapters/*.md`  
+  Chapter-split Markdown files.
+
+- `<BaseName>/chunks.jsonl`  
+  Chunked output for RAG workflows.
+
+- `<BaseName>/diagnostics.json`  
+  Statistics and anomaly warnings.
+
+- `<BaseName>/debug.md`  
+  Debug export for troubleshooting only.
 
 ## Development
 
-要求：
+### Requirements
 
 - Go 1.21+
 - Wails v2
 - Node.js
 
-开发模式：
+### Development Mode
 
 ```bash
 wails dev
 ```
 
-构建：
+### Build
 
 ```bash
 wails build
 ```
 
-测试：
+### Test
 
 ```bash
 go test ./...
 ```
 
-生成批量回归基线：
+### Generate Batch Regression Baselines
 
 ```bash
 go run ./cmd/build-regression-baseline
@@ -73,14 +83,14 @@ go run ./cmd/build-regression-baseline
 
 ## Notes
 
-- 主流程现在是纯 Go，Wails 只保留桌面壳层职责
-- 主 `md` 追求干净可读；调试信息单独放在 `debug.md`
-- 这条链路当前服务于 RAG Markdown，而不是排版导向输出
+- The main pipeline is now pure Go; Wails only remains as the desktop shell layer.
+- The primary `md` output aims to stay clean and readable; debug information is separated into `debug.md`.
+- This pipeline is currently designed for RAG-oriented Markdown, not layout-oriented publishing output.
 
 ## Status
 
-当前阶段可以视为 early beta：
+This project is currently in early beta:
 
-- 主链路可跑
-- 回归、诊断、最小 eval 已具备基础骨架
-- 仍在继续打磨 chunk 策略、评测闭环和批量体验
+- The main pipeline runs.
+- Regression, diagnostics, and minimal evaluation already have a working foundation.
+- Chunking strategy, evaluation loop, and batch workflow are still being refined.
